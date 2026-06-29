@@ -1,0 +1,47 @@
+[project]
+name = "cross-agent-mcp"
+version = "0.1.0"
+description = "MCP server wrapping opencode and Claude Code for cross-family adversarial review"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "npratt" }]
+dependencies = [
+    "mcp[cli]>=1.0",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+claude = ["claude-agent-sdk>=0.2.110"]
+all = ["claude-agent-sdk>=0.2.110"]
+
+[project.scripts]
+cross-agent-mcp = "cross_agent.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cross_agent"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "integration: end-to-end tests requiring real opencode/claude backends (deselect with '-m \"not integration\"')",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
