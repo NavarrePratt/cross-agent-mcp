@@ -15,7 +15,11 @@ import httpx
 
 DEFAULT_BASE_URL = "http://127.0.0.1:4096"
 DEFAULT_PORT = 4096
-DEFAULT_AGENT = "cross-agent-reviewer"
+# When non-empty, read-only prompts request this opencode agent (which must be
+# defined in opencode.json with read-only permissions). Empty string = do not
+# send an agent, falling back to opencode's default "build" agent. Read-only
+# enforcement then relies on the caller's prompt, not opencode-level sandboxing.
+DEFAULT_AGENT = ""
 HEALTH_TIMEOUT = 3.0
 AUTOSERVE_WAIT = 10.0
 AUTOSERVE_POLL = 0.5
@@ -220,13 +224,13 @@ class OpenCodeBackend:
     ) -> str:
         """POST a message to a session and return the assistant text.
 
-        When ``read_only`` is set we request the read-only reviewer agent. If that
-        agent is not configured yet (Phase 2 wiring) the server replies 500 with an
-        ``UnknownError``; we retry once without the agent and annotate the response
-        so the caller knows read-only enforcement is inactive.
+        When ``read_only`` is set and ``config.agent`` is non-empty, we request
+        that opencode agent (expected to be configured with read-only permissions
+        in opencode.json). When ``config.agent`` is empty, no agent is sent and
+        read-only enforcement relies on the caller's prompt.
         """
         body: dict[str, Any] = {"parts": [{"type": "text", "text": text}]}
-        if read_only:
+        if read_only and self.config.agent:
             body["agent"] = self.config.agent
         model_obj = _parse_model(model)
         if model_obj:
@@ -235,17 +239,6 @@ class OpenCodeBackend:
         dir_headers = self._dir_headers(directory)
         msg_path = f"/session/{session_id}/message"
         resp = await self._request("POST", msg_path, json=body, headers=dir_headers)
-        if read_only and resp.status_code == 500:
-            # Reviewer agent not present - fall back to the default agent.
-            body.pop("agent", None)
-            resp = await self._request("POST", msg_path, json=body, headers=dir_headers)
-            text_out = _extract_text(resp.json().get("parts", []))
-            warning = (
-                f"[read-only enforcement inactive: '{self.config.agent}' agent "
-                "not configured - install the opencode reviewer agent (Phase 2) "
-                "to enable read-only sandboxing]\n\n"
-            )
-            return _redact(warning + text_out)
         resp.raise_for_status()
         return _redact(_extract_text(resp.json().get("parts", [])))
 

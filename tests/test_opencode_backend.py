@@ -6,7 +6,6 @@ import httpx
 import pytest
 
 from cross_agent.backends.opencode import (
-    DEFAULT_AGENT,
     OpenCodeBackend,
     OpenCodeConfig,
     _parse_model,
@@ -81,7 +80,8 @@ async def test_prompt_creates_messages_deletes_session(make_backend, captured_re
     assert ("DELETE", "/session/ses_test_123") in methods
 
 
-async def test_prompt_read_only_sends_reviewer_agent(make_backend, captured_requests):
+async def test_prompt_read_only_default_omits_agent(make_backend, captured_requests):
+    """With the default empty agent, read_only=True does not send an agent field."""
     backend = make_backend(_msg_handler("ok"))
     await backend.prompt("review this", read_only=True)
 
@@ -91,7 +91,26 @@ async def test_prompt_read_only_sends_reviewer_agent(make_backend, captured_requ
     import json
 
     body = json.loads(msg_req.content)
-    assert body["agent"] == DEFAULT_AGENT
+    assert "agent" not in body
+
+
+async def test_prompt_read_only_with_explicit_agent_sends_it(make_backend, captured_requests):
+    """When config.agent is set, read_only=True sends that agent."""
+    from cross_agent.backends.opencode import OpenCodeConfig
+
+    backend = make_backend(
+        _msg_handler("ok"),
+        config=OpenCodeConfig(agent="my-reviewer"),
+    )
+    await backend.prompt("review this", read_only=True)
+
+    msg_req = next(
+        r for r in captured_requests if r.url.path.endswith("/message") and r.method == "POST"
+    )
+    import json
+
+    body = json.loads(msg_req.content)
+    assert body["agent"] == "my-reviewer"
 
 
 async def test_prompt_read_only_false_omits_agent(make_backend, captured_requests):
@@ -136,31 +155,15 @@ async def test_prompt_directory_header_strips_crlf(make_backend, captured_reques
     assert saw_sanitized, "no request carried the directory header"
 
 
-# -------------------------------------------------------- read-only fallback
+# ---------------------------------------------------------- read-only agent
 
 
-async def test_prompt_read_only_falls_back_when_agent_missing(make_backend, captured_requests):
-    """A 500 for the unconfigured reviewer agent triggers a retry without the agent."""
-    call_count = {"n": 0}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/session" and request.method == "POST":
-            return httpx.Response(200, json={"id": "ses_fb_1"})
-        if request.url.path.endswith("/message"):
-            call_count["n"] += 1
-            if call_count["n"] == 1:
-                return httpx.Response(500, json={"name": "UnknownError", "data": {"message": "x"}})
-            # second attempt (no agent) succeeds
-            return httpx.Response(
-                200, json={"parts": [{"type": "text", "text": "fallback ok"}]}
-            )
-        return httpx.Response(200, json=True)
-
-    backend = make_backend(handler)
+async def test_prompt_no_warning_when_agent_empty(make_backend):
+    """With the default empty agent, the response has no enforcement warning."""
+    backend = make_backend(_msg_handler("clean response"))
     text, _ = await backend.prompt("hi", read_only=True)
-    assert "read-only enforcement inactive" in text
-    assert "fallback ok" in text
-    assert call_count["n"] == 2
+    assert "read-only enforcement" not in text
+    assert text == "clean response"
 
 
 # ------------------------------------------------------------------ continue
