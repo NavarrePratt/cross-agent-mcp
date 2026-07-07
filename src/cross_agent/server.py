@@ -41,7 +41,16 @@ def get_available_backends() -> list[Backend]:
 
 def build_server() -> FastMCP:
     """Construct the FastMCP server with tools for every available backend."""
-    mcp = FastMCP(SERVER_NAME)
+    mcp = FastMCP(
+        SERVER_NAME,
+        instructions=(
+            "Cross-family adversarial review server. Provides prompt, continue, "
+            "and abort tools for each available backend (opencode for GLM-5.2, "
+            "claude for Claude Code). Read-only by default. Use the <backend>_prompt "
+            "tool for one-shot review requests, <backend>_continue to resume a session "
+            "by id, and <backend>_abort to cancel a running session."
+        ),
+    )
     for backend in get_available_backends():
         register_tools(mcp, backend)
     return mcp
