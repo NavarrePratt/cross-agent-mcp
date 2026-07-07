@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import sys
 
 from mcp.server.fastmcp import FastMCP
 
@@ -22,13 +22,20 @@ def get_available_backends() -> list[Backend]:
     """
     backends: list[Backend] = [OpenCodeBackend()]
     try:
-        from cross_agent.backends.claude import ClaudeBackend  # local import keeps SDK optional
+        import claude_agent_sdk  # noqa: F401  # local import keeps SDK optional
     except ImportError:
         return backends
+    # Import the backend separately so real bugs in claude.py surface rather
+    # than being masked as a missing optional dependency.
+    from cross_agent.backends.claude import ClaudeBackend
+
     try:
         backends.append(ClaudeBackend())
-    except Exception:  # noqa: BLE001 - never let a backend ctor crash server startup
-        pass
+    except Exception as exc:  # noqa: BLE001 - never let a backend ctor crash server startup
+        print(
+            f"cross-agent: Claude backend skipped: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
     return backends
 
 
@@ -43,10 +50,6 @@ def build_server() -> FastMCP:
 def main() -> None:
     """Stdio entry point for ``cross-agent-mcp`` (``[project.scripts]``)."""
     build_server().run(transport="stdio")
-
-
-# Bind backend aclose on server shutdown so spawned opencode servers are cleaned up.
-_original_atexit: Callable | None = None
 
 
 if __name__ == "__main__":

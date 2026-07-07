@@ -10,6 +10,7 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -129,6 +130,9 @@ class OpenCodeBackend:
         self._proc: subprocess.Popen[bytes] | None = None
         self._spawned = False
         self._client: httpx.AsyncClient | None = None
+        # Serializes the health-check-then-spawn in _ensure_server so concurrent
+        # callers cannot each spawn their own ``opencode serve`` process.
+        self._server_lock = asyncio.Lock()
 
     @property
     def name(self) -> str:
@@ -155,17 +159,22 @@ class OpenCodeBackend:
         """Health-check the opencode server; auto-start it if down and enabled."""
         if await self._is_healthy():
             return
-        if not self.config.autoserve:
-            raise RuntimeError(
-                f"opencode server not reachable at {self.config.base_url} "
-                "and CROSS_AGENT_OPENCODE_AUTOSERVE is false."
-            )
-        await self._start_server()
-        if not await self._wait_healthy():
-            raise RuntimeError(
-                f"opencode server did not become healthy at {self.config.base_url} "
-                f"within {AUTOSERVE_WAIT:.0f}s."
-            )
+        async with self._server_lock:
+            # Double-checked locking: another caller may have started the server
+            # while we were waiting for the lock.
+            if await self._is_healthy():
+                return
+            if not self.config.autoserve:
+                raise RuntimeError(
+                    f"opencode server not reachable at {self.config.base_url} "
+                    "and CROSS_AGENT_OPENCODE_AUTOSERVE is false."
+                )
+            await self._start_server()
+            if not await self._wait_healthy():
+                raise RuntimeError(
+                    f"opencode server did not become healthy at {self.config.base_url} "
+                    f"within {AUTOSERVE_WAIT:.0f}s."
+                )
 
     async def _is_healthy(self) -> bool:
         client = await self._ensure_client()
@@ -201,7 +210,11 @@ class OpenCodeBackend:
             return DEFAULT_PORT
 
     async def _request(
-        self, method: str, path: str, *, json: dict[str, Any] | None = None,
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
     ) -> httpx.Response:
         client = await self._ensure_client()
@@ -212,6 +225,14 @@ class OpenCodeBackend:
     def _dir_headers(self, directory: str | None) -> dict[str, str]:
         sanitized = _sanitize_directory(directory)
         return {"x-opencode-directory": sanitized} if sanitized else {}
+
+    def _session_path(self, session_id: str, suffix: str = "") -> str:
+        """Build a ``/session/<id>[/suffix]`` path with the id URL-encoded.
+
+        Encoding with ``safe=""`` ensures a slash or ``?`` in the id cannot
+        retarget the request to a different endpoint.
+        """
+        return f"/session/{quote(session_id, safe='')}{suffix}"
 
     async def _send_message(
         self,
@@ -237,7 +258,7 @@ class OpenCodeBackend:
             body["model"] = model_obj
 
         dir_headers = self._dir_headers(directory)
-        msg_path = f"/session/{session_id}/message"
+        msg_path = self._session_path(session_id, "/message")
         resp = await self._request("POST", msg_path, json=body, headers=dir_headers)
         resp.raise_for_status()
         return _redact(_extract_text(resp.json().get("parts", [])))
@@ -282,14 +303,14 @@ class OpenCodeBackend:
 
     async def abort(self, session_id: str) -> None:
         await self._ensure_server()
-        resp = await self._request("POST", f"/session/{session_id}/abort")
+        resp = await self._request("POST", self._session_path(session_id, "/abort"))
         # 404 means the session already finished; treat as success.
         if resp.status_code not in (200, 404):
             resp.raise_for_status()
 
     async def _delete_session(self, session_id: str) -> None:
         try:
-            await self._request("DELETE", f"/session/{session_id}")
+            await self._request("DELETE", self._session_path(session_id))
         except httpx.HTTPError:
             pass
 
@@ -297,17 +318,25 @@ class OpenCodeBackend:
 
     async def aclose(self) -> None:
         """Tear down the HTTP client and any server subprocess we spawned."""
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
-        if self._spawned and self._proc is not None and self._proc.poll() is None:
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-        self._proc = None
-        self._spawned = False
+        try:
+            if self._client is not None:
+                await self._client.aclose()
+                self._client = None
+        finally:
+            # Subprocess cleanup runs even if client close raised.
+            if self._spawned and self._proc is not None and self._proc.poll() is None:
+                self._proc.terminate()
+                try:
+                    # Blocking, but only runs during shutdown - acceptable.
+                    self._proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+                    try:
+                        self._proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+            self._proc = None
+            self._spawned = False
 
     # convenience for tests/integration streaming (not part of the Protocol)
     async def stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:  # pragma: no cover

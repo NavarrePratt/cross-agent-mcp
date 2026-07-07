@@ -170,3 +170,52 @@ async def test_abort_falls_back_to_cli_stop_for_unknown_session(monkeypatch):
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
     await backend.abort("sid_unknown_finished")
     assert calls and calls[0] == ["claude", "stop", "sid_unknown_finished"]
+
+
+async def test_run_cleans_up_tasks_on_query_exception(monkeypatch):
+    """If query() raises after registering a session_id, _tasks is cleaned up."""
+
+    async def failing_query(*, prompt, options=None):
+        yield SystemMessage(subtype="init", data={"session_id": "sid_fail"})
+        raise RuntimeError("query exploded")
+
+    monkeypatch.setattr("cross_agent.backends.claude.query", failing_query)
+
+    backend = ClaudeBackend()
+    with pytest.raises(RuntimeError, match="query exploded"):
+        await backend.prompt("hi")
+    assert "sid_fail" not in backend._tasks
+
+
+async def test_cli_stop_kills_subprocess_on_timeout(monkeypatch):
+    """When claude stop times out, the subprocess is killed and reaped."""
+    backend = ClaudeBackend()
+
+    killed = []
+    waited = []
+
+    class FakeProc:
+        returncode = None
+
+        async def wait(self):
+            waited.append(True)
+            return 0
+
+        def kill(self):
+            killed.append(True)
+
+    proc = FakeProc()
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return proc
+
+    async def fake_wait_for(coro, timeout):
+        coro.close()  # clean up the never-awaited coroutine
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
+
+    await backend._cli_stop("sid_timeout")
+    assert killed, "subprocess was not killed on timeout"
+    assert waited, "subprocess was not reaped after kill"

@@ -15,7 +15,7 @@ def captured_requests() -> list[httpx.Request]:
 
 
 @pytest.fixture
-def make_backend(captured_requests):
+async def make_backend(captured_requests):
     """Build an OpenCodeBackend wired to an in-process MockTransport.
 
     Each test passes a handler that maps incoming (non-health) requests to
@@ -25,6 +25,7 @@ def make_backend(captured_requests):
     ``autoserve=False`` by default so it never spawns a real process unless a
     test explicitly opts in.
     """
+    created: list[OpenCodeBackend] = []
 
     def _make(
         handler,
@@ -42,6 +43,9 @@ def make_backend(captured_requests):
             return handler(request)
 
         cfg = config or OpenCodeConfig(base_url=base_url, autoserve=False)
+        # Tests never spawn a real opencode process; force autoserve off even
+        # when a custom config is passed in.
+        cfg.autoserve = False
         backend = OpenCodeBackend(config=cfg)
         transport = httpx.MockTransport(wrapped)
         backend._client = httpx.AsyncClient(
@@ -50,6 +54,9 @@ def make_backend(captured_requests):
             transport=transport,
             timeout=httpx.Timeout(300.0, connect=5.0),
         )
+        created.append(backend)
         return backend
 
-    return _make
+    yield _make
+    for backend in created:
+        await backend.aclose()

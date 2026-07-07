@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 
@@ -245,9 +247,7 @@ async def test_autoserve_spawns_opencode_when_down(monkeypatch):
     monkeypatch.setattr("cross_agent.backends.opencode.subprocess.Popen", fake_popen)
 
     # Health probe fails forever, but _wait_healthy short-circuits to True.
-    backend = OpenCodeBackend(
-        OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=True)
-    )
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=True))
     backend._is_healthy = monkeypatch_async(False)  # type: ignore[method-assign]
     backend._wait_healthy = monkeypatch_async(True)  # type: ignore[method-assign]
 
@@ -258,12 +258,76 @@ async def test_autoserve_spawns_opencode_when_down(monkeypatch):
 
 
 async def test_autoserve_disabled_raises_when_down(monkeypatch):
-    backend = OpenCodeBackend(
-        OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=False)
-    )
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=False))
     backend._is_healthy = monkeypatch_async(False)  # type: ignore[method-assign]
     with pytest.raises(RuntimeError, match="not reachable"):
         await backend._ensure_server()
+
+
+async def test_ensure_server_lock_prevents_duplicate_spawns(monkeypatch):
+    """Concurrent _ensure_server calls only spawn one opencode process."""
+    spawned: list[list[str]] = []
+
+    class FakeProc:
+        def __init__(self) -> None:
+            self.returncode = None
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None: ...
+        def wait(self, timeout=None) -> None: ...
+        def kill(self) -> None: ...
+
+    def fake_popen(cmd, **kwargs):
+        spawned.append(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr("cross_agent.backends.opencode.subprocess.Popen", fake_popen)
+
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=True))
+    # Server becomes healthy after it's spawned; before that health checks fail.
+    healthy = [False]
+
+    async def fake_is_healthy():
+        return healthy[0]
+
+    original_start = backend._start_server
+
+    async def fake_start_server():
+        await original_start()
+        healthy[0] = True
+
+    backend._is_healthy = fake_is_healthy  # type: ignore[method-assign]
+    backend._start_server = fake_start_server  # type: ignore[method-assign]
+
+    # Fire 5 concurrent _ensure_server calls; only one should spawn.
+    await asyncio.gather(*[backend._ensure_server() for _ in range(5)])
+    assert len(spawned) == 1
+
+
+# -------------------------------------------------------------- url encoding
+
+
+async def test_session_id_url_encoded_in_message_path(make_backend, captured_requests):
+    """A session_id with slashes/? is URL-encoded so it can't retarget the path."""
+    backend = make_backend(_msg_handler("encoded-ok"))
+    response = await backend.continue_session("ses/evil?abort", "hello")
+
+    # The message endpoint is reached (returns our text), proving the encoded
+    # path doesn't get split by the slash or truncated by the ?.
+    assert response == "encoded-ok"
+    msg_req = next(r for r in captured_requests if r.method == "POST")
+    assert b"ses%2Fevil%3Fabort" in msg_req.url.raw_path
+
+
+async def test_session_id_url_encoded_in_abort_path(make_backend, captured_requests):
+    backend = make_backend(_msg_handler())
+    await backend.abort("ses/evil?abort")
+    abort_req = next(
+        r for r in captured_requests if r.method == "POST" and b"abort" in r.url.raw_path
+    )
+    assert b"ses%2Fevil%3Fabort" in abort_req.url.raw_path
 
 
 def monkeypatch_async(value):

@@ -21,8 +21,8 @@ from claude_agent_sdk import (
 
 # Read-only toolset: pre-approve safe operations and remove write/bash entirely so
 # the model cannot mutate the working tree or shell out, even if it tries.
-READ_ONLY_ALLOWED = ["Read", "Glob", "Grep", "List", "WebSearch", "WebFetch"]
-READ_ONLY_DISALLOWED = ["Write", "Edit", "Bash"]
+READ_ONLY_ALLOWED = ["Read", "Glob", "Grep", "LS", "WebSearch", "WebFetch"]
+READ_ONLY_DISALLOWED = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"]
 
 
 def _text_from_content(content: list[Any]) -> str:
@@ -78,26 +78,33 @@ class ClaudeBackend:
         is_error = False
         errors: list[str] = []
 
-        async for msg in query(prompt=text, options=options):
-            if isinstance(msg, SystemMessage) and msg.subtype == "init":
-                session_id = msg.data.get("session_id") or msg.data.get("sessionID") or session_id
-                if task is not None and session_id is not None:
-                    self._tasks[session_id] = task
-            elif isinstance(msg, AssistantMessage):
-                assistant_chunks.append(_text_from_content(msg.content))
-            elif isinstance(msg, ResultMessage):
-                session_id = msg.session_id or session_id
-                result_text = msg.result
-                is_error = msg.is_error
-                if msg.errors:
-                    errors = list(msg.errors)
-
         try:
+            # The async for loop is inside the try block so the finally always
+            # cleans up _tasks, even if query() raises after registering the task.
+            async for msg in query(prompt=text, options=options):
+                if isinstance(msg, SystemMessage) and msg.subtype == "init":
+                    sid = msg.data.get("session_id") or msg.data.get("sessionID")
+                    session_id = sid or session_id
+                    # One slot per session_id: concurrent runs for the same
+                    # session are a caller bug by Protocol contract.
+                    if task is not None and session_id is not None:
+                        self._tasks[session_id] = task
+                elif isinstance(msg, AssistantMessage):
+                    assistant_chunks.append(_text_from_content(msg.content))
+                elif isinstance(msg, ResultMessage):
+                    session_id = msg.session_id or session_id
+                    result_text = msg.result
+                    is_error = msg.is_error
+                    if msg.errors:
+                        errors = list(msg.errors)
+
             if is_error:
                 detail = "; ".join(errors) if errors else "claude query reported an error"
                 raise RuntimeError(f"claude query failed: {detail}")
-            response = result_text if result_text is not None else "\n".join(
-                c for c in assistant_chunks if c
+            response = (
+                result_text
+                if result_text is not None
+                else "\n".join(c for c in assistant_chunks if c)
             )
             if not response:
                 response = "[claude returned no text response]"
@@ -146,13 +153,18 @@ class ClaudeBackend:
         await self._cli_stop(session_id)
 
     async def _cli_stop(self, session_id: str) -> None:
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
-                "claude", "stop", session_id,
+                "claude",
+                "stop",
+                session_id,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
             await asyncio.wait_for(proc.wait(), timeout=10.0)
         except (OSError, asyncio.TimeoutError):
             # Best-effort: a failed stop is not fatal for an already-finished session.
-            pass
+            if proc is not None and proc.returncode is None:
+                proc.kill()
+                await proc.wait()

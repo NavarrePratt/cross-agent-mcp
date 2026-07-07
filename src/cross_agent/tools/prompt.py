@@ -44,7 +44,7 @@ def register_tools(mcp: FastMCP, backend: Backend) -> None:
         try:
             text, sid = await backend.prompt(prompt, read_only, directory, model)
         except Exception as exc:  # noqa: BLE001 - surface as tool result, not a crash
-            return f"Error: {exc}"
+            return f"Error: {type(exc).__name__}: {exc}"
         return f"Session: {sid}\n\n{text}"
 
     async def _continue(
@@ -56,13 +56,13 @@ def register_tools(mcp: FastMCP, backend: Backend) -> None:
         try:
             return await backend.continue_session(session_id, prompt, read_only, directory)
         except Exception as exc:  # noqa: BLE001 - surface as tool result, not a crash
-            return f"Error: {exc}"
+            return f"Error: {type(exc).__name__}: {exc}"
 
     async def _abort(session_id: str) -> str:
         try:
             await backend.abort(session_id)
         except Exception as exc:  # noqa: BLE001 - surface as tool result, not a crash
-            return f"Error: {exc}"
+            return f"Error: {type(exc).__name__}: {exc}"
         return f"Session {session_id} aborted."
 
     # FastMCP derives the MCP tool name from the explicit ``name`` kwarg, so the

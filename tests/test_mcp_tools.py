@@ -54,14 +54,16 @@ def test_claude_backend_registered_when_sdk_installed():
 def test_claude_backend_skipped_when_sdk_missing(monkeypatch):
     """When claude_agent_sdk cannot be imported, only opencode_* tools register."""
 
-    # Force the local import inside get_available_backends to fail.
-    monkeypatch.setitem(sys.modules, "cross_agent.backends.claude", None)
+    # Force the SDK import inside get_available_backends to fail. Setting the
+    # module to None in sys.modules makes ``import claude_agent_sdk`` raise
+    # ImportError, simulating the optional dependency not being installed.
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
     backends = get_available_backends()
     names = [b.name for b in backends]
     assert names == ["opencode"]
 
     # build_server should also only register opencode_* tools.
-    monkeypatch.setitem(sys.modules, "cross_agent.backends.claude", None)
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
     mcp = build_server()
     tool_names = _tool_names(mcp)
     assert not any(n.startswith("claude_") for n in tool_names)
