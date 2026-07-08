@@ -76,19 +76,19 @@ def test_config_from_env_reads_query_timeout(monkeypatch):
 def test_config_from_env_query_timeout_falls_back_on_invalid(monkeypatch):
     monkeypatch.setenv("CROSS_AGENT_QUERY_TIMEOUT", "not-a-number")
     cfg = OpenCodeConfig.from_env()
-    assert cfg.query_timeout == 600.0
+    assert cfg.query_timeout == 1200.0
 
 
 def test_config_from_env_query_timeout_ignores_nonpositive(monkeypatch):
     monkeypatch.setenv("CROSS_AGENT_QUERY_TIMEOUT", "0")
     cfg = OpenCodeConfig.from_env()
-    assert cfg.query_timeout == 600.0
+    assert cfg.query_timeout == 1200.0
 
 
 def test_config_from_env_query_timeout_rejects_inf(monkeypatch):
     monkeypatch.setenv("CROSS_AGENT_QUERY_TIMEOUT", "inf")
     cfg = OpenCodeConfig.from_env()
-    assert cfg.query_timeout == 600.0
+    assert cfg.query_timeout == 1200.0
 
 
 # ------------------------------------------------------------------- prompt
@@ -323,7 +323,7 @@ async def test_continue_session_uses_config_default_timeout_when_none(monkeypatc
     assert len(captured_timeouts) == 1
     assert isinstance(captured_timeouts[0], httpx.Timeout)
     assert captured_timeouts[0].connect == 5.0
-    assert captured_timeouts[0].read == 600.0  # config default
+    assert captured_timeouts[0].read == 1200.0  # config default
 
 
 async def test_continue_session_per_call_timeout_reaches_httpx(monkeypatch):
@@ -382,7 +382,7 @@ async def test_continue_session_timeout_zero_falls_back_to_default(monkeypatch):
     assert await backend.continue_session("ses_zero", "hello", timeout=0) == "ok"
     assert len(captured_timeouts) == 1
     assert isinstance(captured_timeouts[0], httpx.Timeout)
-    assert captured_timeouts[0].read == 600.0  # fell back to default
+    assert captured_timeouts[0].read == 1200.0  # fell back to default
 
 
 async def test_continue_session_cleans_up_session_tracking(monkeypatch):

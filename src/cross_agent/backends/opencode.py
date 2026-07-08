@@ -23,7 +23,7 @@ DEFAULT_BASE_URL = f"http://127.0.0.1:{DEFAULT_PORT}"
 # send an agent, falling back to opencode's default "build" agent. Read-only
 # enforcement then relies on the caller's prompt, not opencode-level sandboxing.
 DEFAULT_AGENT = ""
-DEFAULT_QUERY_TIMEOUT = 600.0
+DEFAULT_QUERY_TIMEOUT = 1200.0
 HEALTH_TIMEOUT = 3.0
 AUTOSERVE_WAIT = 10.0
 AUTOSERVE_POLL = 0.5

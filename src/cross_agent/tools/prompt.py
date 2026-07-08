@@ -76,7 +76,7 @@ def register_tools(mcp: FastMCP, backend: Backend) -> None:
             f"Returns the response text prefixed with the native session id, which can be "
             f"passed to {prefix}_continue to resume the conversation.\n\n"
             "timeout (seconds) overrides the backend's default query timeout. Set it "
-            "high for long reviews; the default is 600s (10 minutes)."
+            "high for long reviews; the default is 1200s (20 minutes)."
         )
 
     def _continue_desc() -> str:

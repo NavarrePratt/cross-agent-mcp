@@ -370,21 +370,21 @@ async def test_query_timeout_env_var_invalid_falls_back(monkeypatch):
     """Invalid CROSS_AGENT_QUERY_TIMEOUT falls back to the default."""
     monkeypatch.setenv("CROSS_AGENT_QUERY_TIMEOUT", "not-a-number")
     backend = ClaudeBackend()
-    assert backend._query_timeout == 600.0
+    assert backend._query_timeout == 1200.0
 
 
 async def test_query_timeout_env_var_zero_falls_back(monkeypatch):
     """Zero CROSS_AGENT_QUERY_TIMEOUT falls back to the default."""
     monkeypatch.setenv("CROSS_AGENT_QUERY_TIMEOUT", "0")
     backend = ClaudeBackend()
-    assert backend._query_timeout == 600.0
+    assert backend._query_timeout == 1200.0
 
 
 async def test_query_timeout_env_var_inf_falls_back(monkeypatch):
     """inf CROSS_AGENT_QUERY_TIMEOUT falls back to the default."""
     monkeypatch.setenv("CROSS_AGENT_QUERY_TIMEOUT", "inf")
     backend = ClaudeBackend()
-    assert backend._query_timeout == 600.0
+    assert backend._query_timeout == 1200.0
 
 
 async def test_prompt_timeout_none_uses_configured_default(monkeypatch):
@@ -426,4 +426,4 @@ async def test_prompt_timeout_zero_falls_back_to_default(monkeypatch):
 
     backend = ClaudeBackend()
     await backend.prompt("hi", timeout=0)
-    assert captured_timeouts == [600.0]  # default, not 0
+    assert captured_timeouts == [1200.0]  # default, not 0

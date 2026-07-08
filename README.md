@@ -110,7 +110,7 @@ Then set `CROSS_AGENT_OPENCODE_AGENT=cross-agent-reviewer` (see below). With tha
 | `CROSS_AGENT_OPENCODE_BASE_URL` | `http://127.0.0.1:4096` | opencode server URL. Include an explicit port when autoserve is enabled. |
 | `CROSS_AGENT_OPENCODE_AUTOSERVE` | `true` | Auto-start `opencode serve` if the server is unreachable |
 | `CROSS_AGENT_OPENCODE_AGENT` | _(empty)_ | opencode agent name to request for read-only calls; empty = use opencode's default agent |
-| `CROSS_AGENT_QUERY_TIMEOUT` | `600` (10 min) | Query timeout in seconds for both backends |
+| `CROSS_AGENT_QUERY_TIMEOUT` | `1200` (20 min) | Query timeout in seconds for both backends |
 | `OPENCODE_SERVER_USERNAME` | unset | Optional basic-auth username for the opencode server |
 | `OPENCODE_SERVER_PASSWORD` | unset | Optional basic-auth password for the opencode server |
 
@@ -119,7 +119,7 @@ Then set `CROSS_AGENT_OPENCODE_AGENT=cross-agent-reviewer` (see below). With tha
 | Env var | Default | Purpose |
 |---|---|---|
 | `CROSS_AGENT_CLAUDE_MODEL` | unset (CLI default) | Override the Claude model used for every call |
-| `CROSS_AGENT_QUERY_TIMEOUT` | `600` (10 min) | Query timeout in seconds for both backends |
+| `CROSS_AGENT_QUERY_TIMEOUT` | `1200` (20 min) | Query timeout in seconds for both backends |
 
 No auth env vars are needed for the Claude backend; it reuses the `claude` CLI's stored login.
 
@@ -139,7 +139,7 @@ Start a backend-native session. `read_only=True` is the default request mode. Cl
 | `read_only` | `bool` | `true` | Request read-only mode. Claude enforces tool restrictions; opencode requires a configured read-only agent for hard enforcement. |
 | `directory` | `str \| null` | `null` | Working directory for the call |
 | `model` | `str \| null` | `null` | Model override. For opencode, a flat `provider/model` string like `wandb/zai-org/GLM-5.2` (split into `{providerID, modelID}`). For Claude, a model slug like `claude-sonnet-4`. |
-| `timeout` | `float \| null` | `null` | Query timeout in seconds; `null` uses the configured default (600s / 10 min). Set high for long reviews. |
+| `timeout` | `float \| null` | `null` | Query timeout in seconds; `null` uses the configured default (1200s / 20 min). Set high for long reviews. |
 
 ### `<prefix>_continue`
 
@@ -151,7 +151,7 @@ Continue an existing backend-native session by id. The id may come from `<prefix
 | `prompt` | `str` | _(required)_ | The follow-up prompt |
 | `read_only` | `bool` | `true` | Request read-only mode |
 | `directory` | `str \| null` | `null` | Working directory for the call |
-| `timeout` | `float \| null` | `null` | Query timeout in seconds; `null` uses the configured default (600s / 10 min). |
+| `timeout` | `float \| null` | `null` | Query timeout in seconds; `null` uses the configured default (1200s / 20 min). |
 
 ### `<prefix>_abort`
 

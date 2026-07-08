@@ -26,7 +26,7 @@ from cross_agent.config import env_float, validate_timeout
 READ_ONLY_ALLOWED = ["Read", "Glob", "Grep", "LS", "WebSearch", "WebFetch"]
 READ_ONLY_DISALLOWED = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"]
 
-DEFAULT_QUERY_TIMEOUT = 600.0
+DEFAULT_QUERY_TIMEOUT = 1200.0
 TASK_DRAIN_TIMEOUT = 1.0
 
 
