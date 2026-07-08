@@ -52,7 +52,7 @@ async def make_backend(captured_requests):
             base_url=cfg.base_url,
             headers={"content-type": "application/json"},
             transport=transport,
-            timeout=httpx.Timeout(300.0, connect=5.0),
+            timeout=httpx.Timeout(cfg.query_timeout, connect=5.0),
         )
         created.append(backend)
         return backend

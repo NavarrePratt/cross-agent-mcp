@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from cross_agent.backends.opencode import (
+    HEALTH_TIMEOUT,
     OpenCodeBackend,
     OpenCodeConfig,
     _parse_model,
@@ -34,7 +35,7 @@ def _msg_handler(text: str = "PONG", status: int = 200):
                     ],
                 },
             )
-        # DELETE /session/{id} and POST /abort -> 200
+        # POST /abort -> 200
         return httpx.Response(200, json=True)
 
     return handler
@@ -66,10 +67,34 @@ def test_redact_scrubs_known_secret_prefixes():
     assert _redact("plain text with no secrets") == "plain text with no secrets"
 
 
+def test_config_from_env_reads_query_timeout(monkeypatch):
+    monkeypatch.setenv("CROSS_AGENT_QUERY_TIMEOUT", "900")
+    cfg = OpenCodeConfig.from_env()
+    assert cfg.query_timeout == 900.0
+
+
+def test_config_from_env_query_timeout_falls_back_on_invalid(monkeypatch):
+    monkeypatch.setenv("CROSS_AGENT_QUERY_TIMEOUT", "not-a-number")
+    cfg = OpenCodeConfig.from_env()
+    assert cfg.query_timeout == 600.0
+
+
+def test_config_from_env_query_timeout_ignores_nonpositive(monkeypatch):
+    monkeypatch.setenv("CROSS_AGENT_QUERY_TIMEOUT", "0")
+    cfg = OpenCodeConfig.from_env()
+    assert cfg.query_timeout == 600.0
+
+
+def test_config_from_env_query_timeout_rejects_inf(monkeypatch):
+    monkeypatch.setenv("CROSS_AGENT_QUERY_TIMEOUT", "inf")
+    cfg = OpenCodeConfig.from_env()
+    assert cfg.query_timeout == 600.0
+
+
 # ------------------------------------------------------------------- prompt
 
 
-async def test_prompt_creates_messages_deletes_session(make_backend, captured_requests):
+async def test_prompt_creates_message_and_leaves_native_session(make_backend, captured_requests):
     backend = make_backend(_msg_handler("hello"))
     text, sid = await backend.prompt("say hello")
     assert text == "hello"
@@ -78,8 +103,61 @@ async def test_prompt_creates_messages_deletes_session(make_backend, captured_re
     methods = [(r.method, r.url.path) for r in captured_requests]
     assert ("POST", "/session") in methods
     assert ("POST", "/session/ses_test_123/message") in methods
-    # stateless one-shot deletes the session after the response
-    assert ("DELETE", "/session/ses_test_123") in methods
+    # prompt returns a durable native session id; lifecycle stays with opencode.
+    assert ("DELETE", "/session/ses_test_123") not in methods
+    assert "ses_test_123" not in backend._tasks
+    assert "ses_test_123" not in backend._session_locks
+    assert "ses_test_123" not in backend._session_lock_users
+
+
+async def test_prompt_failure_preserves_native_session_id(make_backend, captured_requests):
+    backend = make_backend(_msg_handler("boom", status=500))
+    with pytest.raises(RuntimeError, match="opencode session ses_test_123"):
+        await backend.prompt("say hello")
+
+    methods = [(r.method, r.url.path) for r in captured_requests]
+    assert ("POST", "/session") in methods
+    assert ("POST", "/session/ses_test_123/message") in methods
+    assert ("DELETE", "/session/ses_test_123") not in methods
+    assert "ses_test_123" not in backend._tasks
+    assert "ses_test_123" not in backend._session_locks
+    assert "ses_test_123" not in backend._session_lock_users
+
+
+async def test_prompt_cancellation_aborts_native_session(monkeypatch):
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=False))
+    backend._ensure_server = monkeypatch_async(None)  # type: ignore[method-assign]
+    message_started = asyncio.Event()
+    abort_calls = 0
+
+    async def fake_request(method, path, *, json=None, headers=None, timeout=None):
+        nonlocal abort_calls
+        if path == "/session":
+            return httpx.Response(
+                200,
+                json={"id": "ses_cancel"},
+                request=httpx.Request(method, "http://test/session"),
+            )
+        if path.endswith("/message"):
+            message_started.set()
+            await asyncio.Event().wait()
+        if path.endswith("/abort"):
+            abort_calls += 1
+            return httpx.Response(200, json=True, request=httpx.Request(method, f"http://test{path}"))
+        return httpx.Response(200, json=True, request=httpx.Request(method, f"http://test{path}"))
+
+    backend._request = fake_request  # type: ignore[method-assign]
+
+    task = asyncio.create_task(backend.prompt("hello"))
+    await message_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert abort_calls == 1
+    assert "ses_cancel" not in backend._tasks
+    assert "ses_cancel" not in backend._session_locks
+    assert "ses_cancel" not in backend._session_lock_users
 
 
 async def test_prompt_read_only_default_omits_agent(make_backend, captured_requests):
@@ -190,6 +268,142 @@ async def test_continue_session_passes_resume_session_id(make_backend, captured_
     assert all(r.url.path != "/session" for r in captured_requests if r.method == "POST")
 
 
+async def test_continue_session_serializes_same_native_session(monkeypatch):
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=False))
+    backend._ensure_server = monkeypatch_async(None)  # type: ignore[method-assign]
+    active = 0
+    max_active = 0
+
+    async def fake_request(method, path, *, json=None, headers=None, timeout=None):
+        nonlocal active, max_active
+        if method == "POST" and path.endswith("/message"):
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return httpx.Response(
+                200,
+                json={"parts": [{"type": "text", "text": path}]},
+                request=httpx.Request(method, f"http://test{path}"),
+            )
+        return httpx.Response(200, json=True, request=httpx.Request(method, f"http://test{path}"))
+
+    backend._request = fake_request  # type: ignore[method-assign]
+
+    await asyncio.gather(
+        backend.continue_session("ses_shared", "first"),
+        backend.continue_session("ses_shared", "second"),
+    )
+    assert max_active == 1
+
+
+async def test_continue_session_uses_config_default_timeout_when_none(monkeypatch):
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=False))
+    backend._ensure_server = monkeypatch_async(None)  # type: ignore[method-assign]
+    captured_timeouts = []
+
+    async def fake_request(
+        method,
+        path,
+        *,
+        json=None,
+        headers=None,
+        timeout=httpx.USE_CLIENT_DEFAULT,
+    ):
+        captured_timeouts.append(timeout)
+        return httpx.Response(
+            200,
+            json={"parts": [{"type": "text", "text": "ok"}]},
+            request=httpx.Request(method, f"http://test{path}"),
+        )
+
+    backend._request = fake_request  # type: ignore[method-assign]
+
+    assert await backend.continue_session("ses_default_timeout", "hello") == "ok"
+    assert len(captured_timeouts) == 1
+    assert isinstance(captured_timeouts[0], httpx.Timeout)
+    assert captured_timeouts[0].connect == 5.0
+    assert captured_timeouts[0].read == 600.0  # config default
+
+
+async def test_continue_session_per_call_timeout_reaches_httpx(monkeypatch):
+    """A per-call timeout=120 produces an httpx.Timeout(120) on the message request."""
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=False))
+    backend._ensure_server = monkeypatch_async(None)  # type: ignore[method-assign]
+    captured_timeouts = []
+
+    async def fake_request(
+        method,
+        path,
+        *,
+        json=None,
+        headers=None,
+        timeout=httpx.USE_CLIENT_DEFAULT,
+    ):
+        captured_timeouts.append(timeout)
+        return httpx.Response(
+            200,
+            json={"parts": [{"type": "text", "text": "ok"}]},
+            request=httpx.Request(method, f"http://test{path}"),
+        )
+
+    backend._request = fake_request  # type: ignore[method-assign]
+
+    assert await backend.continue_session("ses_t", "hello", timeout=120.0) == "ok"
+    assert len(captured_timeouts) == 1
+    assert isinstance(captured_timeouts[0], httpx.Timeout)
+    assert captured_timeouts[0].read == 120.0
+    assert captured_timeouts[0].connect == 5.0
+
+
+async def test_continue_session_timeout_zero_falls_back_to_default(monkeypatch):
+    """Per-call timeout=0 falls back to the config default rather than timing out instantly."""
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=False))
+    backend._ensure_server = monkeypatch_async(None)  # type: ignore[method-assign]
+    captured_timeouts = []
+
+    async def fake_request(
+        method,
+        path,
+        *,
+        json=None,
+        headers=None,
+        timeout=httpx.USE_CLIENT_DEFAULT,
+    ):
+        captured_timeouts.append(timeout)
+        return httpx.Response(
+            200,
+            json={"parts": [{"type": "text", "text": "ok"}]},
+            request=httpx.Request(method, f"http://test{path}"),
+        )
+
+    backend._request = fake_request  # type: ignore[method-assign]
+
+    assert await backend.continue_session("ses_zero", "hello", timeout=0) == "ok"
+    assert len(captured_timeouts) == 1
+    assert isinstance(captured_timeouts[0], httpx.Timeout)
+    assert captured_timeouts[0].read == 600.0  # fell back to default
+
+
+async def test_continue_session_cleans_up_session_tracking(monkeypatch):
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=False))
+    backend._ensure_server = monkeypatch_async(None)  # type: ignore[method-assign]
+
+    async def fake_request(method, path, *, json=None, headers=None, timeout=None):
+        return httpx.Response(
+            200,
+            json={"parts": [{"type": "text", "text": "ok"}]},
+            request=httpx.Request(method, f"http://test{path}"),
+        )
+
+    backend._request = fake_request  # type: ignore[method-assign]
+
+    assert await backend.continue_session("ses_cleanup", "hello") == "ok"
+    assert "ses_cleanup" not in backend._tasks
+    assert "ses_cleanup" not in backend._session_locks
+    assert "ses_cleanup" not in backend._session_lock_users
+
+
 # --------------------------------------------------------------------- abort
 
 
@@ -210,6 +424,150 @@ async def test_abort_treats_404_as_success(make_backend):
     backend = make_backend(handler)
     # Should not raise.
     await backend.abort("ses_gone")
+
+
+async def test_abort_cancels_running_task(make_backend, captured_requests):
+    backend = make_backend(_msg_handler())
+    started = asyncio.Event()
+
+    async def blocker():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise
+
+    task = asyncio.create_task(blocker())
+    await started.wait()
+    backend._tasks["ses_block"] = {task}
+
+    await backend.abort("ses_block")
+    assert task.cancelled() or task.done()
+    assert ("POST", "/session/ses_block/abort") in [
+        (r.method, r.url.path) for r in captured_requests
+    ]
+
+
+async def test_abort_cancels_queued_same_session_task(monkeypatch):
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=False))
+    backend._ensure_server = monkeypatch_async(None)  # type: ignore[method-assign]
+    backend._is_healthy = monkeypatch_async(False)  # type: ignore[method-assign]
+
+    started_first = asyncio.Event()
+    message_calls = 0
+
+    async def fake_request(method, path, *, json=None, headers=None, timeout=None):
+        nonlocal message_calls
+        if method == "POST" and path.endswith("/message"):
+            message_calls += 1
+            if message_calls == 1:
+                started_first.set()
+                await asyncio.Event().wait()
+            return httpx.Response(
+                200,
+                json={"parts": [{"type": "text", "text": "ok"}]},
+                request=httpx.Request(method, f"http://test{path}"),
+            )
+        return httpx.Response(200, json=True, request=httpx.Request(method, f"http://test{path}"))
+
+    backend._request = fake_request  # type: ignore[method-assign]
+
+    first = asyncio.create_task(backend.continue_session("ses_shared", "first"))
+    await started_first.wait()
+    second = asyncio.create_task(backend.continue_session("ses_shared", "second"))
+    while len(backend._tasks.get("ses_shared", ())) < 2:
+        await asyncio.sleep(0)
+
+    await backend.abort("ses_shared")
+
+    assert first.cancelled()
+    assert second.cancelled()
+    assert message_calls == 1
+    assert "ses_shared" not in backend._tasks
+    assert "ses_shared" not in backend._session_locks
+    assert "ses_shared" not in backend._session_lock_users
+
+
+async def test_abort_cancels_continue_waiting_for_autoserve(monkeypatch):
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=True))
+    ensure_started = asyncio.Event()
+    abort_calls = 0
+    message_calls = 0
+
+    async def fake_ensure_server():
+        ensure_started.set()
+        await asyncio.Event().wait()
+
+    async def fake_request(method, path, *, json=None, headers=None, timeout=None):
+        nonlocal abort_calls, message_calls
+        if path.endswith("/abort"):
+            abort_calls += 1
+            return httpx.Response(200, json=True, request=httpx.Request(method, f"http://test{path}"))
+        if path.endswith("/message"):
+            message_calls += 1
+            return httpx.Response(
+                200,
+                json={"parts": [{"type": "text", "text": "ok"}]},
+                request=httpx.Request(method, f"http://test{path}"),
+            )
+        return httpx.Response(200, json=True, request=httpx.Request(method, f"http://test{path}"))
+
+    backend._ensure_server = fake_ensure_server  # type: ignore[method-assign]
+    backend._request = fake_request  # type: ignore[method-assign]
+
+    task = asyncio.create_task(backend.continue_session("ses_autoserve", "hello"))
+    await ensure_started.wait()
+
+    await backend.abort("ses_autoserve")
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert abort_calls >= 1
+    assert message_calls == 0
+    assert "ses_autoserve" not in backend._tasks
+    assert "ses_autoserve" not in backend._session_locks
+    assert "ses_autoserve" not in backend._session_lock_users
+
+
+async def test_abort_does_not_autoserve_unknown_unhealthy_session(monkeypatch):
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=True))
+    abort_attempted = False
+
+    async def fail_ensure_server():
+        raise AssertionError("abort should not autoserve")
+
+    async def fake_request(method, path, *, json=None, headers=None, timeout=None):
+        nonlocal abort_attempted
+        abort_attempted = path.endswith("/abort")
+        raise httpx.ConnectError("server down")
+
+    backend._ensure_server = fail_ensure_server  # type: ignore[method-assign]
+    backend._request = fake_request  # type: ignore[method-assign]
+
+    await backend.abort("ses_unknown")
+    assert abort_attempted
+
+
+async def test_timeout_attempts_bounded_native_abort(monkeypatch):
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=False))
+    backend._ensure_server = monkeypatch_async(None)  # type: ignore[method-assign]
+    abort_timeouts = []
+
+    async def fake_request(method, path, *, json=None, headers=None, timeout=None):
+        if path.endswith("/message"):
+            raise httpx.ReadTimeout("slow response")
+        if path.endswith("/abort"):
+            abort_timeouts.append(timeout)
+            return httpx.Response(200, json=True, request=httpx.Request(method, f"http://test{path}"))
+        return httpx.Response(200, json=True, request=httpx.Request(method, f"http://test{path}"))
+
+    backend._request = fake_request  # type: ignore[method-assign]
+
+    with pytest.raises(httpx.TimeoutException):
+        await backend.continue_session("ses_slow", "hello")
+    assert len(abort_timeouts) == 1
+    assert isinstance(abort_timeouts[0], httpx.Timeout)
+    assert abort_timeouts[0].connect == HEALTH_TIMEOUT
 
 
 # --------------------------------------------------------------- secret scrub
@@ -262,6 +620,12 @@ async def test_autoserve_disabled_raises_when_down(monkeypatch):
     backend._is_healthy = monkeypatch_async(False)  # type: ignore[method-assign]
     with pytest.raises(RuntimeError, match="not reachable"):
         await backend._ensure_server()
+
+
+def test_autoserve_base_url_requires_explicit_port():
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1", autoserve=True))
+    with pytest.raises(RuntimeError, match="explicit port"):
+        backend._port_from_url()
 
 
 async def test_ensure_server_lock_prevents_duplicate_spawns(monkeypatch):

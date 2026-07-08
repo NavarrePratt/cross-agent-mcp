@@ -46,9 +46,11 @@ def build_server() -> FastMCP:
         instructions=(
             "Cross-family adversarial review server. Provides prompt, continue, "
             "and abort tools for each available backend (opencode for GLM-5.2, "
-            "claude for Claude Code). Read-only by default. Use the <backend>_prompt "
-            "tool for one-shot review requests, <backend>_continue to resume a session "
-            "by id, and <backend>_abort to cancel a running session."
+            "claude for Claude Code). Read-only is requested by default, with "
+            "enforcement depending on backend configuration. Use the "
+            "<backend>_prompt tool to start a backend-native review session, "
+            "<backend>_continue to resume a native session by id, and "
+            "<backend>_abort to cancel a running session."
         ),
     )
     for backend in get_available_backends():

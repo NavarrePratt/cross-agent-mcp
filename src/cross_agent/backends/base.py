@@ -18,11 +18,15 @@ class Backend(Protocol):
         read_only: bool = True,
         directory: str | None = None,
         model: str | None = None,
+        timeout: float | None = None,
     ) -> tuple[str, str]:
-        """One-shot prompt. Returns ``(response_text, session_id)``.
+        """Start a backend-native session. Returns ``(response_text, session_id)``.
 
-        Stateless by default: the caller may discard ``session_id``. Pass it to
-        :meth:`continue_session` to resume the conversation.
+        The returned ``session_id`` is the native backend/harness id. Pass it to
+        :meth:`continue_session` to resume the same native conversation.
+
+        ``timeout`` overrides the backend's default query timeout (seconds).
+        ``None`` means use the configured default (see each backend).
         """
         ...
 
@@ -32,8 +36,13 @@ class Backend(Protocol):
         text: str,
         read_only: bool = True,
         directory: str | None = None,
+        timeout: float | None = None,
     ) -> str:
-        """Continue an existing session. Returns response text."""
+        """Continue an existing backend-native session. Returns response text.
+
+        The session may have been created by this MCP server or copied from the
+        backend harness directly.
+        """
         ...
 
     async def abort(self, session_id: str) -> None:

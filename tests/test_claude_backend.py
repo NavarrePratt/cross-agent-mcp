@@ -108,6 +108,82 @@ async def test_continue_sets_resume(monkeypatch):
     assert q.captured["options"].resume == "sid_resume"
 
 
+async def test_continue_tracks_native_session_before_init(monkeypatch):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking_query(*, prompt, options=None):
+        started.set()
+        await release.wait()
+        yield _init("sid_resume")
+        yield _result("ack", "sid_resume")
+
+    monkeypatch.setattr("cross_agent.backends.claude.query", blocking_query)
+
+    backend = ClaudeBackend()
+    task = asyncio.create_task(backend.continue_session("sid_resume", "again"))
+    await started.wait()
+    assert "sid_resume" in backend._tasks
+
+    release.set()
+    assert await task == "ack"
+    assert "sid_resume" not in backend._tasks
+    assert "sid_resume" not in backend._session_locks
+    assert "sid_resume" not in backend._session_lock_users
+
+
+async def test_continue_serializes_same_native_session(monkeypatch):
+    active = 0
+    max_active = 0
+
+    async def serial_query(*, prompt, options=None):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            await asyncio.sleep(0.01)
+            yield _init("sid_resume")
+            yield _result("ack", "sid_resume")
+        finally:
+            active -= 1
+
+    monkeypatch.setattr("cross_agent.backends.claude.query", serial_query)
+
+    backend = ClaudeBackend()
+    await asyncio.gather(
+        backend.continue_session("sid_resume", "first"),
+        backend.continue_session("sid_resume", "second"),
+    )
+
+    assert max_active == 1
+
+
+async def test_continue_abort_cancels_running_native_session(monkeypatch):
+    started = asyncio.Event()
+    stopped: list[str] = []
+
+    async def blocking_query(*, prompt, options=None):
+        started.set()
+        await asyncio.Event().wait()
+        yield _init("sid_resume")
+
+    monkeypatch.setattr("cross_agent.backends.claude.query", blocking_query)
+
+    backend = ClaudeBackend()
+
+    async def fake_cli_stop(session_id):
+        stopped.append(session_id)
+
+    backend._cli_stop = fake_cli_stop  # type: ignore[method-assign]
+    task = asyncio.create_task(backend.continue_session("sid_resume", "again"))
+    await started.wait()
+
+    await backend.abort("sid_resume")
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert stopped == ["sid_resume"]
+
+
 async def test_prompt_error_surfaces_message(monkeypatch):
     q = _async_query([_init(), _result(is_error=True, errors=["rate limited"], session_id="sid_e")])
     monkeypatch.setattr("cross_agent.backends.claude.query", q)
@@ -134,6 +210,12 @@ async def test_prompt_falls_back_to_assistant_text_when_result_none(monkeypatch)
 
 async def test_abort_cancels_running_task(monkeypatch):
     backend = ClaudeBackend()
+    stopped: list[str] = []
+
+    async def fake_cli_stop(session_id):
+        stopped.append(session_id)
+
+    backend._cli_stop = fake_cli_stop  # type: ignore[method-assign]
 
     # A long-running coroutine we can cancel mid-flight.
     started = asyncio.Event()
@@ -151,6 +233,7 @@ async def test_abort_cancels_running_task(monkeypatch):
 
     await backend.abort("sid_block")
     assert task.cancelled() or task.done()
+    assert stopped == ["sid_block"]
 
 
 async def test_abort_falls_back_to_cli_stop_for_unknown_session(monkeypatch):
@@ -219,3 +302,128 @@ async def test_cli_stop_kills_subprocess_on_timeout(monkeypatch):
     await backend._cli_stop("sid_timeout")
     assert killed, "subprocess was not killed on timeout"
     assert waited, "subprocess was not reaped after kill"
+
+
+async def test_prompt_timeout_surfaces_as_error(monkeypatch):
+    """A query that exceeds its timeout raises a TimeoutError surfaced by _run."""
+    async def blocking_query(*, prompt, options=None):
+        await asyncio.Event().wait()
+        yield _init("sid_t")
+
+    monkeypatch.setattr("cross_agent.backends.claude.query", blocking_query)
+
+    backend = ClaudeBackend()
+    with pytest.raises(asyncio.TimeoutError):
+        await backend.prompt("hi", timeout=0.001)
+
+
+async def test_prompt_timeout_stops_discovered_native_session(monkeypatch):
+    stopped: list[str] = []
+
+    async def blocking_query(*, prompt, options=None):
+        yield _init("sid_prompt_timeout")
+        await asyncio.Event().wait()
+        yield _result("never", "sid_prompt_timeout")
+
+    async def fake_cli_stop(session_id):
+        stopped.append(session_id)
+
+    monkeypatch.setattr("cross_agent.backends.claude.query", blocking_query)
+
+    backend = ClaudeBackend()
+    backend._cli_stop = fake_cli_stop  # type: ignore[method-assign]
+
+    with pytest.raises(asyncio.TimeoutError):
+        await backend.prompt("hi", timeout=0.01)
+    assert stopped == ["sid_prompt_timeout"]
+
+
+async def test_continue_timeout_stops_known_native_session(monkeypatch):
+    backend = ClaudeBackend()
+    stopped: list[str] = []
+
+    async def blocking_query(*, prompt, options=None):
+        await asyncio.Event().wait()
+        yield _init("sid_resume")
+
+    async def fake_cli_stop(session_id):
+        stopped.append(session_id)
+
+    monkeypatch.setattr("cross_agent.backends.claude.query", blocking_query)
+    backend._cli_stop = fake_cli_stop  # type: ignore[method-assign]
+
+    with pytest.raises(asyncio.TimeoutError):
+        await backend.continue_session("sid_resume", "again", timeout=0.001)
+    assert stopped == ["sid_resume"]
+    assert "sid_resume" not in backend._session_locks
+    assert "sid_resume" not in backend._session_lock_users
+
+
+async def test_query_timeout_env_var_sets_default(monkeypatch):
+    """CROSS_AGENT_QUERY_TIMEOUT sets the Claude backend's default timeout."""
+    monkeypatch.setenv("CROSS_AGENT_QUERY_TIMEOUT", "900")
+    backend = ClaudeBackend()
+    assert backend._query_timeout == 900.0
+
+
+async def test_query_timeout_env_var_invalid_falls_back(monkeypatch):
+    """Invalid CROSS_AGENT_QUERY_TIMEOUT falls back to the default."""
+    monkeypatch.setenv("CROSS_AGENT_QUERY_TIMEOUT", "not-a-number")
+    backend = ClaudeBackend()
+    assert backend._query_timeout == 600.0
+
+
+async def test_query_timeout_env_var_zero_falls_back(monkeypatch):
+    """Zero CROSS_AGENT_QUERY_TIMEOUT falls back to the default."""
+    monkeypatch.setenv("CROSS_AGENT_QUERY_TIMEOUT", "0")
+    backend = ClaudeBackend()
+    assert backend._query_timeout == 600.0
+
+
+async def test_query_timeout_env_var_inf_falls_back(monkeypatch):
+    """inf CROSS_AGENT_QUERY_TIMEOUT falls back to the default."""
+    monkeypatch.setenv("CROSS_AGENT_QUERY_TIMEOUT", "inf")
+    backend = ClaudeBackend()
+    assert backend._query_timeout == 600.0
+
+
+async def test_prompt_timeout_none_uses_configured_default(monkeypatch):
+    """When timeout=None, the configured _query_timeout is used, not an unbounded wait."""
+    monkeypatch.setenv("CROSS_AGENT_QUERY_TIMEOUT", "42")
+    q = _async_query([_init("sid_default_t"), _result("ok", "sid_default_t")])
+    monkeypatch.setattr("cross_agent.backends.claude.query", q)
+
+    captured_timeouts = []
+
+    original_wait = asyncio.wait
+
+    async def capturing_wait(fs, timeout=None):
+        captured_timeouts.append(timeout)
+        return await original_wait(fs, timeout=timeout)
+
+    monkeypatch.setattr(asyncio, "wait", capturing_wait)
+
+    backend = ClaudeBackend()
+    assert backend._query_timeout == 42.0
+    await backend.prompt("hi")
+    assert captured_timeouts == [42.0]
+
+
+async def test_prompt_timeout_zero_falls_back_to_default(monkeypatch):
+    """Per-call timeout=0 falls back to the configured default."""
+    q = _async_query([_init("sid_zero_t"), _result("ok", "sid_zero_t")])
+    monkeypatch.setattr("cross_agent.backends.claude.query", q)
+
+    captured_timeouts = []
+
+    original_wait = asyncio.wait
+
+    async def capturing_wait(fs, timeout=None):
+        captured_timeouts.append(timeout)
+        return await original_wait(fs, timeout=timeout)
+
+    monkeypatch.setattr(asyncio, "wait", capturing_wait)
+
+    backend = ClaudeBackend()
+    await backend.prompt("hi", timeout=0)
+    assert captured_timeouts == [600.0]  # default, not 0

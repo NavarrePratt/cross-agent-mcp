@@ -75,7 +75,7 @@ Add to the `"mcp"` block in your `opencode.json`:
 
 ### Optional: a read-only opencode agent
 
-By default the opencode backend sends no `agent` field, so read-only calls use opencode's default agent and rely on the caller's prompt to stay read-only. For real sandboxed enforcement, define a read-only agent in `opencode.json` and point the backend at it:
+By default the opencode backend sends no `agent` field, so `read_only=True` calls use opencode's default agent and rely on the caller's prompt to stay read-only. For real sandboxed enforcement, define a read-only agent in `opencode.json` and point the backend at it:
 
 ```json
 {
@@ -107,9 +107,10 @@ Then set `CROSS_AGENT_OPENCODE_AGENT=cross-agent-reviewer` (see below). With tha
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `CROSS_AGENT_OPENCODE_BASE_URL` | `http://127.0.0.1:4096` | opencode server URL |
+| `CROSS_AGENT_OPENCODE_BASE_URL` | `http://127.0.0.1:4096` | opencode server URL. Include an explicit port when autoserve is enabled. |
 | `CROSS_AGENT_OPENCODE_AUTOSERVE` | `true` | Auto-start `opencode serve` if the server is unreachable |
 | `CROSS_AGENT_OPENCODE_AGENT` | _(empty)_ | opencode agent name to request for read-only calls; empty = use opencode's default agent |
+| `CROSS_AGENT_QUERY_TIMEOUT` | `600` (10 min) | Query timeout in seconds for both backends |
 | `OPENCODE_SERVER_USERNAME` | unset | Optional basic-auth username for the opencode server |
 | `OPENCODE_SERVER_PASSWORD` | unset | Optional basic-auth password for the opencode server |
 
@@ -118,6 +119,7 @@ Then set `CROSS_AGENT_OPENCODE_AGENT=cross-agent-reviewer` (see below). With tha
 | Env var | Default | Purpose |
 |---|---|---|
 | `CROSS_AGENT_CLAUDE_MODEL` | unset (CLI default) | Override the Claude model used for every call |
+| `CROSS_AGENT_QUERY_TIMEOUT` | `600` (10 min) | Query timeout in seconds for both backends |
 
 No auth env vars are needed for the Claude backend; it reuses the `claude` CLI's stored login.
 
@@ -129,29 +131,31 @@ Errors are returned as `"Error: <Type>: <message>"` text rather than raised, so 
 
 ### `<prefix>_prompt`
 
-Send a one-shot prompt. Read-only by default: the backend can read files, search, and fetch, but not write or execute commands. Returns the response text prefixed with the session id, which can be passed to `<prefix>_continue` to resume.
+Start a backend-native session. `read_only=True` is the default request mode. Claude enforces this with tool restrictions; opencode hard enforcement requires `CROSS_AGENT_OPENCODE_AGENT` to point at a read-only opencode agent. Returns the response text prefixed with the native session id, which can be passed to `<prefix>_continue` to resume from this MCP server or from the backend harness directly.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `prompt` | `str` | _(required)_ | The prompt text |
-| `read_only` | `bool` | `true` | Read-only mode (no write/exec) |
+| `read_only` | `bool` | `true` | Request read-only mode. Claude enforces tool restrictions; opencode requires a configured read-only agent for hard enforcement. |
 | `directory` | `str \| null` | `null` | Working directory for the call |
 | `model` | `str \| null` | `null` | Model override. For opencode, a flat `provider/model` string like `wandb/zai-org/GLM-5.2` (split into `{providerID, modelID}`). For Claude, a model slug like `claude-sonnet-4`. |
+| `timeout` | `float \| null` | `null` | Query timeout in seconds; `null` uses the configured default (600s / 10 min). Set high for long reviews. |
 
 ### `<prefix>_continue`
 
-Continue an existing session by id. Read-only by default, matching the one-shot tool.
+Continue an existing backend-native session by id. The id may come from `<prefix>_prompt` or from the underlying backend harness. `read_only=True` is requested by default, matching the prompt tool.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `session_id` | `str` | _(required)_ | Session id returned from `<prefix>_prompt` |
+| `session_id` | `str` | _(required)_ | Native backend session id returned from `<prefix>_prompt` or copied from the backend harness |
 | `prompt` | `str` | _(required)_ | The follow-up prompt |
-| `read_only` | `bool` | `true` | Read-only mode |
+| `read_only` | `bool` | `true` | Request read-only mode |
 | `directory` | `str \| null` | `null` | Working directory for the call |
+| `timeout` | `float \| null` | `null` | Query timeout in seconds; `null` uses the configured default (600s / 10 min). |
 
 ### `<prefix>_abort`
 
-Abort a running session by id. No-op if the session already finished.
+Request cancellation of a running session by id. No-op if the session already finished.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -168,7 +172,7 @@ Call mcp__cross-agent__opencode_prompt with:
 - directory: "/Users/you/myproject"
 ```
 
-The response comes back prefixed with the opencode session id. GLM-5.2 runs the review with read-only access to your tree; nothing is written or executed.
+The response comes back prefixed with the opencode session id. With `CROSS_AGENT_OPENCODE_AGENT` set to a read-only opencode agent, GLM-5.2 reviews with sandboxed read/search access. Without that configuration, the MCP call requests read-only behavior but opencode's default agent permissions still apply.
 
 ### Ask Claude for a second opinion (from Codex)
 
@@ -183,7 +187,7 @@ Codex invokes the cross-agent Claude backend, which drives `claude-agent-sdk` wi
 
 ### Multi-turn conversation with continue
 
-Start with a one-shot prompt and capture the returned session id:
+Start a native backend session and capture the returned session id:
 
 ```
 Call opencode_prompt with:
@@ -193,7 +197,7 @@ Call opencode_prompt with:
 -> "Session: ses_abc123\n\n<findings>"
 ```
 
-Then continue the same session with a follow-up, reusing the session id:
+Then continue the same native session with a follow-up, reusing the session id:
 
 ```
 Call opencode_continue with:
@@ -201,16 +205,35 @@ Call opencode_continue with:
 - prompt: "Of those findings, which are critical versus nice-to-have? Justify each."
 ```
 
-Use `opencode_abort` (or `claude_abort`) to cancel a long-running session early; it is a no-op if the session already finished.
+Use `opencode_abort` (or `claude_abort`) to request cancellation of a long-running session early; it is a no-op if the session already finished.
+
+You can also pass a session id copied from the underlying backend harness. For
+example, if an opencode session is already running elsewhere, call
+`opencode_continue` with that native opencode session id. The MCP server does
+not store transcripts or wrap ids; the native backend remains the source of
+truth for history and deletion.
+
+### Prompting tips
+
+The reviewing agent can explore your codebase on its own. Claude uses restricted read/search tools in `read_only=True`; opencode gets equivalent hard enforcement when you configure a read-only opencode agent. Keep prompts short and let the reviewer form its own understanding.
+
+- **Give paths, not diffs.** Say "Review `src/auth.py` for security issues" with the `directory` parameter set, not "Review this diff: ```diff ... 200 lines ...```". The reviewer reads the files itself.
+- **Point at the change set.** For branch reviews, name the files or the commit range ("Review the changes in `src/session/` from the last 3 commits") rather than pasting the diff.
+- **Ask focused questions.** "Are there race conditions in the session pool?" gets better results than dumping the code and asking "thoughts?".
+- **Use `directory` for every call.** The reviewer needs the working directory to read files; without it, it can't see your tree.
+
+Large prompts waste tokens and context window on both sides. The reviewer is a coding agent with file access, not a chatbot that needs everything pasted in.
 
 ## How it works
 
 The server is a thin [FastMCP](https://gofastmcp.com) stdio server. At startup it detects which backends are available and registers their tools:
 
-- **opencode backend** drives a local `opencode serve` HTTP API over `httpx` (default `http://127.0.0.1:4096`). On the first call it health-checks the server and, if `CROSS_AGENT_OPENCODE_AUTOSERVE` is enabled, spawns `opencode serve` as a subprocess it owns and tears it down on shutdown. Read-only calls optionally request a configured read-only opencode agent. The backend sanitizes the `directory` value before it lands in an HTTP header (stripping NUL/CR/LF to prevent header injection), URL-encodes session ids in request paths, and redacts secret-like patterns (`sk-...`, `ghp_...`, `hf_...`, `xox...`, `whsec_...`, long hex/base64 blobs) from response text before it reaches the MCP client.
+- **opencode backend** drives a local `opencode serve` HTTP API over `httpx` (default `http://127.0.0.1:4096`). On the first call it health-checks the server and, if `CROSS_AGENT_OPENCODE_AUTOSERVE` is enabled, spawns `opencode serve` as a subprocess it owns and tears it down on shutdown. Read-only calls optionally request a configured read-only opencode agent. The backend leaves successful prompt sessions durable in opencode, sanitizes the `directory` value before it lands in an HTTP header (stripping NUL/CR/LF to prevent header injection), URL-encodes session ids in request paths, and redacts secret-like patterns (`sk-...`, `ghp_...`, `hf_...`, `xox...`, `whsec_...`, long hex/base64 blobs) from response text before it reaches the MCP client.
 - **Claude backend** drives `claude-agent-sdk`, which spawns the `claude` CLI in-process and inherits the calling environment, so it reuses the CLI's stored enterprise auth with no API key. Read-only calls restrict the model to `Read`, `Glob`, `Grep`, `LS`, `WebSearch`, `WebFetch` and disallow `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, and `Bash`. Running sessions are tracked by asyncio task so `abort` can cancel an in-flight call, falling back to `claude stop <session_id>` for already-finished sessions.
 
-One-shot prompts create an ephemeral session that is cleaned up after the response; `continue` keeps the session alive across turns.
+Prompt calls create backend-native sessions that remain durable in the native
+harness. The MCP server only tracks in-flight calls for local cancellation and
+serializes MCP-originated requests to the same native session.
 
 ## Development
 

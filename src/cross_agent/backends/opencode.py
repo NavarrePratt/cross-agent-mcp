@@ -10,17 +10,20 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
-DEFAULT_BASE_URL = "http://127.0.0.1:4096"
+from cross_agent.config import env_float, validate_timeout
+
 DEFAULT_PORT = 4096
+DEFAULT_BASE_URL = f"http://127.0.0.1:{DEFAULT_PORT}"
 # When non-empty, read-only prompts request this opencode agent (which must be
 # defined in opencode.json with read-only permissions). Empty string = do not
 # send an agent, falling back to opencode's default "build" agent. Read-only
 # enforcement then relies on the caller's prompt, not opencode-level sandboxing.
 DEFAULT_AGENT = ""
+DEFAULT_QUERY_TIMEOUT = 600.0
 HEALTH_TIMEOUT = 3.0
 AUTOSERVE_WAIT = 10.0
 AUTOSERVE_POLL = 0.5
@@ -57,6 +60,7 @@ class OpenCodeConfig:
     agent: str = DEFAULT_AGENT
     username: str | None = None
     password: str | None = None
+    query_timeout: float = DEFAULT_QUERY_TIMEOUT
 
     @classmethod
     def from_env(cls) -> OpenCodeConfig:
@@ -72,6 +76,7 @@ class OpenCodeConfig:
             agent=os.environ.get("CROSS_AGENT_OPENCODE_AGENT", DEFAULT_AGENT),
             username=os.environ.get("OPENCODE_SERVER_USERNAME"),
             password=os.environ.get("OPENCODE_SERVER_PASSWORD"),
+            query_timeout=env_float("CROSS_AGENT_QUERY_TIMEOUT", DEFAULT_QUERY_TIMEOUT),
         )
 
 
@@ -133,6 +138,12 @@ class OpenCodeBackend:
         # Serializes the health-check-then-spawn in _ensure_server so concurrent
         # callers cannot each spawn their own ``opencode serve`` process.
         self._server_lock = asyncio.Lock()
+        # Native opencode session id -> running MCP task, for abort support.
+        self._tasks: dict[str, set[asyncio.Task[Any]]] = {}
+        # Process-local serialization for MCP-originated calls to the same native
+        # session. Other opencode clients may still use the session concurrently.
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._session_lock_users: dict[str, int] = {}
 
     @property
     def name(self) -> str:
@@ -151,7 +162,7 @@ class OpenCodeBackend:
                 base_url=self.config.base_url,
                 auth=self._auth(),
                 headers={"content-type": "application/json"},
-                timeout=httpx.Timeout(300.0, connect=5.0),
+                timeout=httpx.Timeout(self.config.query_timeout, connect=5.0),
             )
         return self._client
 
@@ -204,10 +215,13 @@ class OpenCodeBackend:
         self._spawned = True
 
     def _port_from_url(self) -> int:
-        try:
-            return int(self.config.base_url.rsplit(":", 1)[1].split("/")[0])
-        except (IndexError, ValueError):
-            return DEFAULT_PORT
+        parsed = urlsplit(self.config.base_url)
+        if parsed.port is not None:
+            return parsed.port
+        raise RuntimeError(
+            "CROSS_AGENT_OPENCODE_BASE_URL must include an explicit port "
+            "when CROSS_AGENT_OPENCODE_AUTOSERVE is true."
+        )
 
     async def _request(
         self,
@@ -216,9 +230,10 @@ class OpenCodeBackend:
         *,
         json: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        timeout: Any = httpx.USE_CLIENT_DEFAULT,
     ) -> httpx.Response:
         client = await self._ensure_client()
-        return await client.request(method, path, json=json, headers=headers)
+        return await client.request(method, path, json=json, headers=headers, timeout=timeout)
 
     # ----------------------------------------------------------------- helpers
 
@@ -234,6 +249,68 @@ class OpenCodeBackend:
         """
         return f"/session/{quote(session_id, safe='')}{suffix}"
 
+    def _session_lock(self, session_id: str) -> asyncio.Lock:
+        lock = self._session_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[session_id] = lock
+        return lock
+
+    def _begin_session_use(self, session_id: str) -> asyncio.Lock:
+        lock = self._session_lock(session_id)
+        self._session_lock_users[session_id] = self._session_lock_users.get(session_id, 0) + 1
+        return lock
+
+    def _end_session_use(self, session_id: str) -> None:
+        users = self._session_lock_users.get(session_id, 0) - 1
+        if users > 0:
+            self._session_lock_users[session_id] = users
+            return
+        self._session_lock_users.pop(session_id, None)
+        self._session_locks.pop(session_id, None)
+
+    def _track_task(self, session_id: str, task: asyncio.Task[Any]) -> None:
+        self._tasks.setdefault(session_id, set()).add(task)
+
+    def _untrack_task(self, session_id: str, task: asyncio.Task[Any]) -> None:
+        tasks = self._tasks.get(session_id)
+        if tasks is None:
+            return
+        tasks.discard(task)
+        if not tasks:
+            self._tasks.pop(session_id, None)
+
+    async def _abort_native(self, session_id: str) -> None:
+        resp = await self._request(
+            "POST",
+            self._session_path(session_id, "/abort"),
+            timeout=httpx.Timeout(HEALTH_TIMEOUT, connect=HEALTH_TIMEOUT),
+        )
+        # 404 means the session already finished; treat as success.
+        if resp.status_code not in (200, 404):
+            resp.raise_for_status()
+
+    def _cancel_tasks(self, session_id: str) -> list[asyncio.Task[Any]]:
+        tasks = list(self._tasks.get(session_id, ()))
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        return tasks
+
+    async def _drain_cancelled_tasks(self, tasks: list[asyncio.Task[Any]]) -> None:
+        if not tasks:
+            return
+        done, _ = await asyncio.wait(tasks, timeout=HEALTH_TIMEOUT)
+        for task in done:
+            if task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    if not task.cancelled():
+                        raise
+                except Exception:
+                    pass
+
     async def _send_message(
         self,
         session_id: str,
@@ -242,6 +319,7 @@ class OpenCodeBackend:
         read_only: bool,
         directory: str | None,
         model: str | None,
+        timeout: float | None = None,
     ) -> str:
         """POST a message to a session and return the assistant text.
 
@@ -250,6 +328,43 @@ class OpenCodeBackend:
         in opencode.json). When ``config.agent`` is empty, no agent is sent and
         read-only enforcement relies on the caller's prompt.
         """
+        task = asyncio.current_task()
+        if task is not None:
+            self._track_task(session_id, task)
+        lock = self._begin_session_use(session_id)
+        try:
+            await self._ensure_server()
+            async with lock:
+                return await self._send_message_locked(
+                    session_id,
+                    text,
+                    read_only=read_only,
+                    directory=directory,
+                    model=model,
+                    timeout=timeout,
+                )
+        except asyncio.CancelledError:
+            try:
+                await self._abort_native(session_id)
+            except httpx.HTTPError:
+                pass
+            raise
+        finally:
+            if task is not None:
+                self._untrack_task(session_id, task)
+            self._end_session_use(session_id)
+
+    async def _send_message_locked(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        read_only: bool,
+        directory: str | None,
+        model: str | None,
+        timeout: float | None = None,
+    ) -> str:
+        """POST a message to a session with the caller holding the session lock."""
         body: dict[str, Any] = {"parts": [{"type": "text", "text": text}]}
         if read_only and self.config.agent:
             body["agent"] = self.config.agent
@@ -259,7 +374,18 @@ class OpenCodeBackend:
 
         dir_headers = self._dir_headers(directory)
         msg_path = self._session_path(session_id, "/message")
-        resp = await self._request("POST", msg_path, json=body, headers=dir_headers)
+        effective_timeout = validate_timeout(timeout, self.config.query_timeout)
+        request_timeout = httpx.Timeout(effective_timeout, connect=5.0)
+        try:
+            resp = await self._request(
+                "POST", msg_path, json=body, headers=dir_headers, timeout=request_timeout
+            )
+        except httpx.TimeoutException:
+            try:
+                await self._abort_native(session_id)
+            except httpx.HTTPError:
+                pass
+            raise
         resp.raise_for_status()
         return _redact(_extract_text(resp.json().get("parts", [])))
 
@@ -271,6 +397,7 @@ class OpenCodeBackend:
         read_only: bool = True,
         directory: str | None = None,
         model: str | None = None,
+        timeout: float | None = None,
     ) -> tuple[str, str]:
         await self._ensure_server()
         create = await self._request(
@@ -280,13 +407,18 @@ class OpenCodeBackend:
         session_id = create.json()["id"]
         try:
             response = await self._send_message(
-                session_id, text, read_only=read_only, directory=directory, model=model
+                session_id,
+                text,
+                read_only=read_only,
+                directory=directory,
+                model=model,
+                timeout=timeout,
             )
-        except Exception:
-            # Best-effort cleanup of the ephemeral session on failure.
-            await self._delete_session(session_id)
-            raise
-        await self._delete_session(session_id)
+        except Exception as exc:
+            raise RuntimeError(
+                f"opencode session {session_id} was created but message failed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
         return response, session_id
 
     async def continue_session(
@@ -295,24 +427,26 @@ class OpenCodeBackend:
         text: str,
         read_only: bool = True,
         directory: str | None = None,
+        timeout: float | None = None,
     ) -> str:
-        await self._ensure_server()
         return await self._send_message(
-            session_id, text, read_only=read_only, directory=directory, model=None
+            session_id,
+            text,
+            read_only=read_only,
+            directory=directory,
+            model=None,
+            timeout=timeout,
         )
 
     async def abort(self, session_id: str) -> None:
-        await self._ensure_server()
-        resp = await self._request("POST", self._session_path(session_id, "/abort"))
-        # 404 means the session already finished; treat as success.
-        if resp.status_code not in (200, 404):
-            resp.raise_for_status()
-
-    async def _delete_session(self, session_id: str) -> None:
+        tasks = self._cancel_tasks(session_id)
         try:
-            await self._request("DELETE", self._session_path(session_id))
-        except httpx.HTTPError:
+            await self._abort_native(session_id)
+        except httpx.TransportError:
             pass
+        await self._drain_cancelled_tasks(tasks)
+        for task in tasks:
+            self._untrack_task(session_id, task)
 
     # -------------------------------------------------------------- lifecycle
 
