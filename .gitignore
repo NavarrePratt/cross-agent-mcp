@@ -14,3 +14,4 @@ build/
 
 # Local verification artifacts
 server.err.log
+.durable_*

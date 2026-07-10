@@ -5,9 +5,10 @@ from __future__ import annotations
 import sys
 
 import pytest
+from mcp.server.fastmcp import FastMCP
 
 from cross_agent.server import build_server, get_available_backends
-from cross_agent.tools.prompt import _call_continue, _call_prompt
+from cross_agent.tools.prompt import _call_continue, _call_prompt, register_tools
 
 
 class LegacyBackend:
@@ -111,10 +112,110 @@ class ModernBackend:
         self.calls.append(("abort", (session_id,), {}))
 
 
+class PositionalOnlyTimeoutBackend:
+    name = "positional_timeout"
+    calls: list[tuple[str, tuple[object, ...]]]
+
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def prompt(
+        self,
+        text: str,
+        read_only: bool = True,
+        directory: str | None = None,
+        model: str | None = None,
+        timeout: float | None = None,
+        /,
+    ) -> tuple[str, str]:
+        self.calls.append(("prompt", (text, read_only, directory, model, timeout)))
+        return "positional timeout response", "positional_timeout_session"
+
+    async def continue_session(
+        self,
+        session_id: str,
+        text: str,
+        read_only: bool = True,
+        directory: str | None = None,
+        timeout: float | None = None,
+        /,
+    ) -> str:
+        self.calls.append(("continue", (session_id, text, read_only, directory, timeout)))
+        return "positional timeout continued"
+
+    async def abort(self, session_id: str, /) -> None:
+        self.calls.append(("abort", (session_id,)))
+
+
+class KwargsBackend:
+    name = "kwargs"
+    calls: list[tuple[str, tuple[object, ...], dict[str, object]]]
+
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def prompt(
+        self,
+        text: str,
+        read_only: bool = True,
+        directory: str | None = None,
+        model: str | None = None,
+        **kwargs: object,
+    ) -> tuple[str, str]:
+        self.calls.append(("prompt", (text, read_only, directory, model), kwargs))
+        return "kwargs response", "kwargs_session"
+
+    async def continue_session(
+        self,
+        session_id: str,
+        text: str,
+        read_only: bool = True,
+        directory: str | None = None,
+        **kwargs: object,
+    ) -> str:
+        self.calls.append(("continue", (session_id, text, read_only, directory), kwargs))
+        return "kwargs continued"
+
+    async def abort(self, session_id: str) -> None:
+        self.calls.append(("abort", (session_id,), {}))
+
+
+class FailingBackend(ModernBackend):
+    name = "failing"
+
+    async def prompt(
+        self,
+        text: str,
+        read_only: bool = True,
+        directory: str | None = None,
+        model: str | None = None,
+        timeout: float | None = None,
+    ) -> tuple[str, str]:
+        raise ValueError("prompt failed")
+
+    async def continue_session(
+        self,
+        session_id: str,
+        text: str,
+        read_only: bool = True,
+        directory: str | None = None,
+        timeout: float | None = None,
+    ) -> str:
+        raise RuntimeError("continue failed")
+
+    async def abort(self, session_id: str) -> None:
+        raise OSError("abort failed")
+
+
 def _tool_names(mcp) -> list[str]:
     import asyncio
 
     return [t.name for t in asyncio.run(mcp.list_tools())]
+
+
+async def _call_tool_text(mcp: FastMCP, name: str, arguments: dict[str, object]) -> str:
+    content, _ = await mcp.call_tool(name, arguments)
+    return "\n".join(item.text for item in content)
 
 
 def test_opencode_tools_always_register():
@@ -173,18 +274,80 @@ def test_claude_backend_skipped_when_sdk_missing(monkeypatch):
 
 def test_tool_functions_have_distinct_descriptions():
     mcp = build_server()
-    names = _tool_names(mcp)
+    import asyncio
+
+    tools = asyncio.run(mcp.list_tools())
+    names = [tool.name for tool in tools]
     # opencode and claude (if present) tools never collide.
     assert len(names) == len(set(names))
+    for tool in tools:
+        assert tool.description
+    opencode_descriptions = [
+        tool.description for tool in tools if tool.name.startswith("opencode_")
+    ]
+    assert len(opencode_descriptions) == len(set(opencode_descriptions))
 
 
-def test_prompt_and_continue_tool_schemas_expose_timeout():
+def test_tool_schemas_expose_parameter_descriptions():
     import asyncio
 
     mcp = build_server()
     tools = {tool.name: tool for tool in asyncio.run(mcp.list_tools())}
-    assert "timeout" in tools["opencode_prompt"].inputSchema["properties"]
-    assert "timeout" in tools["opencode_continue"].inputSchema["properties"]
+    prompt_props = tools["opencode_prompt"].inputSchema["properties"]
+    continue_props = tools["opencode_continue"].inputSchema["properties"]
+    abort_props = tools["opencode_abort"].inputSchema["properties"]
+
+    for name in ("prompt", "read_only", "directory", "model", "timeout"):
+        assert prompt_props[name]["description"]
+    for name in ("session_id", "prompt", "read_only", "directory", "timeout"):
+        assert continue_props[name]["description"]
+    assert abort_props["session_id"]["description"]
+    assert "1200" not in tools["opencode_prompt"].description
+    assert "1200" not in tools["opencode_continue"].description
+
+
+async def test_registered_tool_wrappers_return_public_output_contracts():
+    backend = ModernBackend()
+    mcp = FastMCP("contract")
+    register_tools(mcp, backend)
+
+    prompt = await _call_tool_text(
+        mcp,
+        "modern_prompt",
+        {"prompt": "hello", "directory": "/tmp/project", "timeout": 2.5},
+    )
+    continued = await _call_tool_text(
+        mcp,
+        "modern_continue",
+        {"session_id": "modern_session", "prompt": "again", "timeout": 3.5},
+    )
+    aborted = await _call_tool_text(
+        mcp,
+        "modern_abort",
+        {"session_id": "modern_session"},
+    )
+
+    assert prompt == "Session: modern_session\n\nmodern response"
+    assert continued == "modern continued"
+    assert aborted == "Abort requested for session modern_session."
+
+
+async def test_registered_tool_wrappers_return_error_text_contracts():
+    backend = FailingBackend()
+    mcp = FastMCP("errors")
+    register_tools(mcp, backend)
+
+    prompt = await _call_tool_text(mcp, "failing_prompt", {"prompt": "hello"})
+    continued = await _call_tool_text(
+        mcp,
+        "failing_continue",
+        {"session_id": "s", "prompt": "again"},
+    )
+    aborted = await _call_tool_text(mcp, "failing_abort", {"session_id": "s"})
+
+    assert prompt == "Error: ValueError: prompt failed"
+    assert continued == "Error: RuntimeError: continue failed"
+    assert aborted == "Error: OSError: abort failed"
 
 
 async def test_call_prompt_preserves_legacy_backend_without_timeout():
@@ -315,4 +478,66 @@ async def test_call_continue_preserves_positional_only_legacy_backend_without_ti
     assert text == "positional continued"
     assert backend.calls == [
         ("continue", ("positional_session", "again", False, "/tmp/project"))
+    ]
+
+
+async def test_call_helpers_pass_positional_only_timeout():
+    backend = PositionalOnlyTimeoutBackend()
+
+    text, sid = await _call_prompt(
+        backend,
+        "hello",
+        read_only=True,
+        directory="/tmp/project",
+        model="provider/model",
+        timeout=2.5,
+    )
+    continued = await _call_continue(
+        backend,
+        "positional_timeout_session",
+        "again",
+        read_only=False,
+        directory="/tmp/project",
+        timeout=3.5,
+    )
+
+    assert (text, sid, continued) == (
+        "positional timeout response",
+        "positional_timeout_session",
+        "positional timeout continued",
+    )
+    assert backend.calls == [
+        ("prompt", ("hello", True, "/tmp/project", "provider/model", 2.5)),
+        ("continue", ("positional_timeout_session", "again", False, "/tmp/project", 3.5)),
+    ]
+
+
+async def test_call_helpers_pass_timeout_through_kwargs_backend():
+    backend = KwargsBackend()
+
+    text, sid = await _call_prompt(
+        backend,
+        "hello",
+        read_only=True,
+        directory="/tmp/project",
+        model="provider/model",
+        timeout=2.5,
+    )
+    continued = await _call_continue(
+        backend,
+        "kwargs_session",
+        "again",
+        read_only=False,
+        directory="/tmp/project",
+        timeout=3.5,
+    )
+
+    assert (text, sid, continued) == (
+        "kwargs response",
+        "kwargs_session",
+        "kwargs continued",
+    )
+    assert backend.calls == [
+        ("prompt", ("hello", True, "/tmp/project", "provider/model"), {"timeout": 2.5}),
+        ("continue", ("kwargs_session", "again", False, "/tmp/project"), {"timeout": 3.5}),
     ]

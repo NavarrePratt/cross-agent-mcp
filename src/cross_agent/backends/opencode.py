@@ -206,6 +206,7 @@ class OpenCodeBackend:
     async def _start_server(self) -> None:
         """Spawn ``opencode serve --port <port>`` as a subprocess we own."""
         port = self._port_from_url()
+        self._cleanup_spawned_process()
         cmd = ["opencode", "serve", "--port", str(port)]
         self._proc = subprocess.Popen(  # noqa: S603 - trusted local binary
             cmd,
@@ -302,14 +303,12 @@ class OpenCodeBackend:
             return
         done, _ = await asyncio.wait(tasks, timeout=HEALTH_TIMEOUT)
         for task in done:
-            if task.done():
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    if not task.cancelled():
-                        raise
-                except Exception:
-                    pass
+            if task.cancelled():
+                continue
+            try:
+                task.result()
+            except Exception:
+                pass
 
     async def _send_message(
         self,
@@ -343,12 +342,6 @@ class OpenCodeBackend:
                     model=model,
                     timeout=timeout,
                 )
-        except asyncio.CancelledError:
-            try:
-                await self._abort_native(session_id)
-            except httpx.HTTPError:
-                pass
-            raise
         finally:
             if task is not None:
                 self._untrack_task(session_id, task)
@@ -380,7 +373,7 @@ class OpenCodeBackend:
             resp = await self._request(
                 "POST", msg_path, json=body, headers=dir_headers, timeout=request_timeout
             )
-        except httpx.TimeoutException:
+        except (httpx.TimeoutException, asyncio.CancelledError):
             try:
                 await self._abort_native(session_id)
             except httpx.HTTPError:
@@ -441,14 +434,38 @@ class OpenCodeBackend:
     async def abort(self, session_id: str) -> None:
         tasks = self._cancel_tasks(session_id)
         try:
-            await self._abort_native(session_id)
-        except httpx.TransportError:
-            pass
-        await self._drain_cancelled_tasks(tasks)
-        for task in tasks:
-            self._untrack_task(session_id, task)
+            try:
+                await self._abort_native(session_id)
+            except httpx.HTTPError:
+                pass
+            await self._drain_cancelled_tasks(tasks)
+        finally:
+            for task in tasks:
+                self._untrack_task(session_id, task)
 
     # -------------------------------------------------------------- lifecycle
+
+    def _cleanup_spawned_process(self) -> None:
+        proc = self._proc
+        if proc is None:
+            self._spawned = False
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+            else:
+                proc.wait(timeout=0)
+        finally:
+            self._proc = None
+            self._spawned = False
 
     async def aclose(self) -> None:
         """Tear down the HTTP client and any server subprocess we spawned."""
@@ -458,19 +475,7 @@ class OpenCodeBackend:
                 self._client = None
         finally:
             # Subprocess cleanup runs even if client close raised.
-            if self._spawned and self._proc is not None and self._proc.poll() is None:
-                self._proc.terminate()
-                try:
-                    # Blocking, but only runs during shutdown - acceptable.
-                    self._proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self._proc.kill()
-                    try:
-                        self._proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        pass
-            self._proc = None
-            self._spawned = False
+            self._cleanup_spawned_process()
 
     # convenience for tests/integration streaming (not part of the Protocol)
     async def stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:  # pragma: no cover

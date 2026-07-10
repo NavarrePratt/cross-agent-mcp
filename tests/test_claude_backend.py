@@ -65,6 +65,23 @@ async def test_prompt_returns_result_and_session_id(monkeypatch):
     assert q.captured["prompt"] == "Reply with exactly: PONG"
 
 
+async def test_prompt_success_does_not_stop_native_session(monkeypatch):
+    stopped: list[str] = []
+    q = _async_query([_init("sid_success"), _result("ok", "sid_success")])
+    monkeypatch.setattr("cross_agent.backends.claude.query", q)
+
+    backend = ClaudeBackend()
+
+    async def fake_cli_stop(session_id):
+        stopped.append(session_id)
+
+    backend._cli_stop = fake_cli_stop  # type: ignore[method-assign]
+
+    assert await backend.prompt("hi") == ("ok", "sid_success")
+    assert stopped == []
+    assert "sid_success" not in backend._tasks
+
+
 async def test_prompt_read_only_sets_tool_restrictions(monkeypatch):
     q = _async_query([_init(), _result("ok", "sid_ro")])
     monkeypatch.setattr("cross_agent.backends.claude.query", q)
@@ -182,6 +199,34 @@ async def test_continue_abort_cancels_running_native_session(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert stopped == ["sid_resume"]
+
+
+async def test_prompt_outer_cancellation_stops_discovered_native_session(monkeypatch):
+    started = asyncio.Event()
+    stopped: list[str] = []
+
+    async def blocking_query(*, prompt, options=None):
+        yield _init("sid_outer_cancel")
+        started.set()
+        await asyncio.Event().wait()
+        yield _result("never", "sid_outer_cancel")
+
+    async def fake_cli_stop(session_id):
+        stopped.append(session_id)
+
+    monkeypatch.setattr("cross_agent.backends.claude.query", blocking_query)
+
+    backend = ClaudeBackend()
+    backend._cli_stop = fake_cli_stop  # type: ignore[method-assign]
+    task = asyncio.create_task(backend.prompt("hi"))
+    await started.wait()
+    assert "sid_outer_cancel" in backend._tasks
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert stopped == ["sid_outer_cancel"]
+    assert "sid_outer_cancel" not in backend._tasks
 
 
 async def test_prompt_error_surfaces_message(monkeypatch):
@@ -355,6 +400,7 @@ async def test_continue_timeout_stops_known_native_session(monkeypatch):
     with pytest.raises(asyncio.TimeoutError):
         await backend.continue_session("sid_resume", "again", timeout=0.001)
     assert stopped == ["sid_resume"]
+    assert "sid_resume" not in backend._tasks
     assert "sid_resume" not in backend._session_locks
     assert "sid_resume" not in backend._session_lock_users
 
