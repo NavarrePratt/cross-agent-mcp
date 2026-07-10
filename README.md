@@ -1,5 +1,7 @@
 # cross-agent-mcp
 
+> **Warning: this project was vibe coded.** It was built interactively with GLM-5.2 on the [opencode](https://opencode.ai) harness, with inference provided by [WandB](https://wandb.ai). Expect rough edges, untested code paths, and bugs. The author is actively using it day to day, so issues are being found and fixed as they surface, but treat the current state accordingly.
+
 An MCP server that wraps two AI coding-agent backends - [opencode](https://opencode.ai) and [Claude Code](https://docs.claude.com/en/docs/claude-code) - behind a unified `prompt` / `continue` / `abort` tool interface, for cross-family adversarial code review. One backend lets a Claude session ask GLM-5.2 (via opencode) for a second opinion; the other lets opencode or Codex ask Claude for one. The server runs as a stdio MCP server and is intended to be registered in whichever coding agent you drive day to day.
 
 Install just the opencode backend, or install both with the optional `[claude]` extra. No API keys are required: opencode uses its own configured provider auth, and the Claude backend reuses the `claude` CLI's stored login.
@@ -129,6 +131,10 @@ Each backend registers three tools, prefixed with the backend name: `opencode_pr
 
 Errors are returned as `"Error: <Type>: <message>"` text rather than raised, so the calling agent always gets a readable result.
 
+Successful prompt calls return `Session: <native-session-id>` followed by the
+response text. Continue calls return only the response text. Abort calls return
+`Abort requested for session <native-session-id>.`
+
 ### `<prefix>_prompt`
 
 Start a backend-native session. `read_only=True` is the default request mode. Claude enforces this with tool restrictions; opencode hard enforcement requires `CROSS_AGENT_OPENCODE_AGENT` to point at a read-only opencode agent. Returns the response text prefixed with the native session id, which can be passed to `<prefix>_continue` to resume from this MCP server or from the backend harness directly.
@@ -139,23 +145,23 @@ Start a backend-native session. `read_only=True` is the default request mode. Cl
 | `read_only` | `bool` | `true` | Request read-only mode. Claude enforces tool restrictions; opencode requires a configured read-only agent for hard enforcement. |
 | `directory` | `str \| null` | `null` | Working directory for the call |
 | `model` | `str \| null` | `null` | Model override. For opencode, a flat `provider/model` string like `wandb/zai-org/GLM-5.2` (split into `{providerID, modelID}`). For Claude, a model slug like `claude-sonnet-4`. |
-| `timeout` | `float \| null` | `null` | Query timeout in seconds; `null` uses the configured default (1200s / 20 min). Set high for long reviews. |
+| `timeout` | `float \| null` | `null` | Query timeout in seconds; `null`, non-positive, and non-finite values use `CROSS_AGENT_QUERY_TIMEOUT` (package default: 1200s / 20 min). Set high for long reviews. |
 
 ### `<prefix>_continue`
 
-Continue an existing backend-native session by id. The id may come from `<prefix>_prompt` or from the underlying backend harness. `read_only=True` is requested by default, matching the prompt tool.
+Continue an existing backend-native session by id. The id may come from `<prefix>_prompt` or from the underlying backend harness. `read_only=True` is requested by default, matching the prompt tool. Claude enforces that with tool restrictions; opencode hard enforcement still depends on a configured read-only opencode agent.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `session_id` | `str` | _(required)_ | Native backend session id returned from `<prefix>_prompt` or copied from the backend harness |
 | `prompt` | `str` | _(required)_ | The follow-up prompt |
-| `read_only` | `bool` | `true` | Request read-only mode |
+| `read_only` | `bool` | `true` | Request read-only mode. Claude enforces tool restrictions; opencode requires a configured read-only agent for hard enforcement. |
 | `directory` | `str \| null` | `null` | Working directory for the call |
-| `timeout` | `float \| null` | `null` | Query timeout in seconds; `null` uses the configured default (1200s / 20 min). |
+| `timeout` | `float \| null` | `null` | Query timeout in seconds; `null`, non-positive, and non-finite values use `CROSS_AGENT_QUERY_TIMEOUT` (package default: 1200s / 20 min). |
 
 ### `<prefix>_abort`
 
-Request cancellation of a running session by id. No-op if the session already finished.
+Request best-effort cancellation of a running session by id. Unknown or already-finished sessions may still call the backend's native stop/abort mechanism, depending on that backend.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -205,13 +211,21 @@ Call opencode_continue with:
 - prompt: "Of those findings, which are critical versus nice-to-have? Justify each."
 ```
 
-Use `opencode_abort` (or `claude_abort`) to request cancellation of a long-running session early; it is a no-op if the session already finished.
+Use `opencode_abort` (or `claude_abort`) to request cancellation of a long-running session early; unknown or already-finished sessions are handled best-effort by the backend's native stop/abort path.
 
 You can also pass a session id copied from the underlying backend harness. For
 example, if an opencode session is already running elsewhere, call
 `opencode_continue` with that native opencode session id. The MCP server does
 not store transcripts or wrap ids; the native backend remains the source of
 truth for history and deletion.
+
+There is intentionally no MCP delete or TTL mechanism. Clean up stored
+transcripts and session history with the native backend's own tools, because
+that is where durable history lives. The MCP server keeps only process-local
+maps for in-flight calls so it can cancel active work and serialize concurrent
+MCP-originated writes to the same native session. If a prompt creates a native
+session and the first message fails, the error includes that native session id
+so you can inspect, continue, stop, or delete it using the backend harness.
 
 ### Prompting tips
 
@@ -228,7 +242,7 @@ Large prompts waste tokens and context window on both sides. The reviewer is a c
 
 The server is a thin [FastMCP](https://gofastmcp.com) stdio server. At startup it detects which backends are available and registers their tools:
 
-- **opencode backend** drives a local `opencode serve` HTTP API over `httpx` (default `http://127.0.0.1:4096`). On the first call it health-checks the server and, if `CROSS_AGENT_OPENCODE_AUTOSERVE` is enabled, spawns `opencode serve` as a subprocess it owns and tears it down on shutdown. Read-only calls optionally request a configured read-only opencode agent. The backend leaves successful prompt sessions durable in opencode, sanitizes the `directory` value before it lands in an HTTP header (stripping NUL/CR/LF to prevent header injection), URL-encodes session ids in request paths, and redacts secret-like patterns (`sk-...`, `ghp_...`, `hf_...`, `xox...`, `whsec_...`, long hex/base64 blobs) from response text before it reaches the MCP client.
+- **opencode backend** drives a local `opencode serve` HTTP API over `httpx` (default `http://127.0.0.1:4096`). On the first call it health-checks the server and, if `CROSS_AGENT_OPENCODE_AUTOSERVE` is enabled, spawns `opencode serve` as a subprocess it owns and tears it down on shutdown. Read-only calls optionally request a configured read-only opencode agent. The backend leaves successful prompt sessions durable in opencode, sanitizes the `directory` value before it lands in an HTTP header (stripping NUL/CR/LF to prevent header injection), URL-encodes session ids in request paths, and redacts secret-like patterns (`sk-...`, `sk_live_...`, `ghp_...`, `github_pat_...`, `hf_...`, `xox...`, `whsec_...`, long hex/base64 blobs) from response text before it reaches the MCP client.
 - **Claude backend** drives `claude-agent-sdk`, which spawns the `claude` CLI in-process and inherits the calling environment, so it reuses the CLI's stored enterprise auth with no API key. Read-only calls restrict the model to `Read`, `Glob`, `Grep`, `LS`, `WebSearch`, `WebFetch` and disallow `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, and `Bash`. Running sessions are tracked by asyncio task so `abort` can cancel an in-flight call, falling back to `claude stop <session_id>` for already-finished sessions.
 
 Prompt calls create backend-native sessions that remain durable in the native
@@ -255,7 +269,3 @@ uv run python scripts/verify_live.py
 ```
 
 CI (`.github/workflows/ci.yml`) runs `ruff check` and `pytest -m "not integration"` on push and pull requests.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
