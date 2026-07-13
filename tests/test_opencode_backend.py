@@ -41,6 +41,35 @@ def _msg_handler(text: str = "PONG", status: int = 200):
     return handler
 
 
+def _msg_error_handler():
+    """Serve the semantic error shape returned by opencode with HTTP 200."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session" and request.method == "POST":
+            return httpx.Response(200, json={"id": "ses_test_123"})
+        if request.url.path.startswith("/session/") and request.url.path.endswith("/message"):
+            return httpx.Response(
+                200,
+                json={
+                    "info": {
+                        "agent": "build",
+                        "error": {
+                            "name": "APIError",
+                            "data": {
+                                "message": "Missing bearer authentication in header",
+                                "statusCode": 401,
+                                "responseBody": "secret=sk-" + "x" * 40,
+                            },
+                        },
+                    },
+                    "parts": [],
+                },
+            )
+        return httpx.Response(200, json=True)
+
+    return handler
+
+
 # --------------------------------------------------------------------- helpers
 
 
@@ -122,6 +151,18 @@ async def test_prompt_failure_preserves_native_session_id(make_backend, captured
     assert "ses_test_123" not in backend._tasks
     assert "ses_test_123" not in backend._session_locks
     assert "ses_test_123" not in backend._session_lock_users
+
+
+async def test_prompt_surfaces_embedded_response_error(make_backend):
+    backend = make_backend(_msg_error_handler())
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await backend.prompt("say hello")
+
+    message = str(exc_info.value)
+    assert "opencode session ses_test_123" in message
+    assert "APIError (HTTP 401): Missing bearer authentication in header" in message
+    assert "secret=" not in message
 
 
 async def test_prompt_cancellation_aborts_native_session(monkeypatch):
@@ -347,6 +388,16 @@ async def test_continue_session_passes_resume_session_id(make_backend, captured_
     await backend.continue_session("ses_xyz", "ack")
     # Only a message POST is made against the resumed session id (no new session).
     assert all(r.url.path != "/session" for r in captured_requests if r.method == "POST")
+
+
+async def test_continue_session_surfaces_embedded_response_error(make_backend):
+    backend = make_backend(_msg_error_handler())
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"APIError \(HTTP 401\): Missing bearer authentication in header",
+    ):
+        await backend.continue_session("ses_existing", "again")
 
 
 async def test_continue_session_serializes_same_native_session(monkeypatch):

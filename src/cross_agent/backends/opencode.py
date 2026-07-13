@@ -127,6 +127,35 @@ def _extract_text(parts: list[dict[str, Any]]) -> str:
     return "\n".join(chunks)
 
 
+def _extract_response_error(payload: dict[str, Any]) -> str | None:
+    """Return a safe summary when opencode embeds an error in a 200 response."""
+    info = payload.get("info")
+    if not isinstance(info, dict):
+        return None
+    error = info.get("error")
+    if not error:
+        return None
+    if isinstance(error, str):
+        return _redact(error)
+    if not isinstance(error, dict):
+        return "opencode returned an assistant error"
+
+    name = error.get("name")
+    label = name if isinstance(name, str) and name else "opencode assistant error"
+    data = error.get("data")
+    if not isinstance(data, dict):
+        data = {}
+
+    status = data.get("statusCode")
+    if isinstance(status, int):
+        label = f"{label} (HTTP {status})"
+
+    message = data.get("message", error.get("message"))
+    if isinstance(message, str) and message:
+        label = f"{label}: {message}"
+    return _redact(label)
+
+
 class OpenCodeBackend:
     """Backend that drives a local ``opencode serve`` instance over HTTP."""
 
@@ -380,7 +409,11 @@ class OpenCodeBackend:
                 pass
             raise
         resp.raise_for_status()
-        return _redact(_extract_text(resp.json().get("parts", [])))
+        payload = resp.json()
+        response_error = _extract_response_error(payload)
+        if response_error:
+            raise RuntimeError(response_error)
+        return _redact(_extract_text(payload.get("parts", [])))
 
     # ----------------------------------------------------------------- Backend
 

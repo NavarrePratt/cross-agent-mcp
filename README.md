@@ -4,7 +4,7 @@
 
 An MCP server that wraps two AI coding-agent backends - [opencode](https://opencode.ai) and [Claude Code](https://docs.claude.com/en/docs/claude-code) - behind a unified `prompt` / `continue` / `abort` tool interface, for cross-family adversarial code review. One backend lets a Claude session ask GLM-5.2 (via opencode) for a second opinion; the other lets opencode or Codex ask Claude for one. The server runs as a stdio MCP server and is intended to be registered in whichever coding agent you drive day to day.
 
-Install just the opencode backend, or install both with the optional `[claude]` extra. No API keys are required: opencode uses its own configured provider auth, and the Claude backend reuses the `claude` CLI's stored login.
+Install just the opencode backend, or install both with the optional `[claude]` extra. No separate API keys are required: opencode uses its configured provider auth, and the Claude backend reuses the `claude` CLI's stored login. If the opencode provider reads credentials from environment variables, the MCP client must forward them to this server.
 
 ## Install
 
@@ -57,7 +57,19 @@ Add to `~/.codex/config.toml`:
 [mcp_servers.cross-agent]
 command = "uvx"
 args = ["--from", "git+https://github.com/NavarrePratt/cross-agent-mcp[claude]", "cross-agent-mcp"]
+env_vars = ["WANDB_API_KEY", "WANDB_INFERENCE_PROJECT"]
 ```
+
+Codex only forwards environment variables listed in `env_vars` to stdio MCP
+servers. List every variable used by your opencode provider configuration; the
+example above matches the WandB provider used for GLM-5.2. The configuration
+contains variable names only, while their values still come from the Codex
+process environment. Run `codex mcp get cross-agent` to confirm that Codex
+resolves them, then restart Codex so it starts a new MCP process.
+
+If an older `opencode serve` process is already listening at the configured
+address, a new MCP process will reuse it. Restart that server as well after
+changing provider credentials or forwarded environment variables.
 
 ### OpenCode
 
@@ -115,6 +127,11 @@ Then set `CROSS_AGENT_OPENCODE_AGENT=cross-agent-reviewer` (see below). With tha
 | `CROSS_AGENT_QUERY_TIMEOUT` | `1200` (20 min) | Query timeout in seconds for both backends |
 | `OPENCODE_SERVER_USERNAME` | unset | Optional basic-auth username for the opencode server |
 | `OPENCODE_SERVER_PASSWORD` | unset | Optional basic-auth password for the opencode server |
+
+Provider-specific variables such as `WANDB_API_KEY` and
+`WANDB_INFERENCE_PROJECT` are consumed by opencode rather than by this package.
+They must still be present in the MCP server environment because an
+automatically started `opencode serve` process inherits that environment.
 
 ### Claude backend
 
