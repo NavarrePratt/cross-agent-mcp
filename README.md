@@ -2,7 +2,7 @@
 
 > **Warning: this project was vibe coded.** It was built interactively with GLM-5.2 on the [opencode](https://opencode.ai) harness, with inference provided by [WandB](https://wandb.ai). Expect rough edges, untested code paths, and bugs. The author is actively using it day to day, so issues are being found and fixed as they surface, but treat the current state accordingly.
 
-An MCP server that wraps two AI coding-agent backends - [opencode](https://opencode.ai) and [Claude Code](https://docs.claude.com/en/docs/claude-code) - behind a unified `prompt` / `continue` / `abort` tool interface, for cross-family adversarial code review. One backend lets a Claude session ask GLM-5.2 (via opencode) for a second opinion; the other lets opencode or Codex ask Claude for one. The server runs as a stdio MCP server and is intended to be registered in whichever coding agent you drive day to day.
+An MCP server that wraps two AI coding-agent backends - [opencode](https://opencode.ai) and [Claude Code](https://docs.claude.com/en/docs/claude-code) - behind a unified `prompt` / `continue` / `abort` tool interface for cross-family conversations, second opinions, and adversarial code review. One backend lets a Claude session ask an opencode model such as GLM-5.2 for another perspective; the other lets opencode or Codex ask Claude. The server runs as a stdio MCP server and is intended to be registered in whichever coding agent you drive day to day.
 
 Install just the opencode backend, or install both with the optional `[claude]` extra. No separate API keys are required: opencode uses its configured provider auth, and the Claude backend reuses the `claude` CLI's stored login. If the opencode provider reads credentials from environment variables, the MCP client must forward them to this server.
 
@@ -41,7 +41,9 @@ Add to the `mcpServers` block in `~/.claude.json` (or run `claude mcp add`):
       "type": "stdio",
       "command": "uvx",
       "args": ["--from", "git+https://github.com/NavarrePratt/cross-agent-mcp[claude]", "cross-agent-mcp"],
-      "env": {}
+      "env": {
+        "CROSS_AGENT_OPENCODE_AGENT": "cross-agent-readonly"
+      }
     }
   }
 }
@@ -58,6 +60,9 @@ Add to `~/.codex/config.toml`:
 command = "uvx"
 args = ["--from", "git+https://github.com/NavarrePratt/cross-agent-mcp[claude]", "cross-agent-mcp"]
 env_vars = ["WANDB_API_KEY", "WANDB_INFERENCE_PROJECT"]
+
+[mcp_servers.cross-agent.env]
+CROSS_AGENT_OPENCODE_AGENT = "cross-agent-readonly"
 ```
 
 Codex only forwards environment variables listed in `env_vars` to stdio MCP
@@ -81,39 +86,48 @@ Add to the `"mcp"` block in your `opencode.json`:
     "cross-agent": {
       "type": "stdio",
       "command": ["uvx", "--from", "git+https://github.com/NavarrePratt/cross-agent-mcp[claude]", "cross-agent-mcp"],
-      "enabled": true
-    }
-  }
-}
-```
-
-### Optional: a read-only opencode agent
-
-By default the opencode backend sends no `agent` field, so `read_only=True` calls use opencode's default agent and rely on the caller's prompt to stay read-only. For real sandboxed enforcement, define a read-only agent in `opencode.json` and point the backend at it:
-
-```json
-{
-  "agent": {
-    "cross-agent-reviewer": {
-      "description": "Read-only reviewer for cross-agent adversarial review.",
-      "mode": "primary",
-      "permission": {
-        "edit": "deny",
-        "bash": "deny",
-        "read": "allow",
-        "glob": "allow",
-        "grep": "allow",
-        "list": "allow",
-        "webfetch": "allow",
-        "websearch": "allow",
-        "task": "allow"
+      "enabled": true,
+      "environment": {
+        "CROSS_AGENT_OPENCODE_AGENT": "cross-agent-readonly"
       }
     }
   }
 }
 ```
 
-Then set `CROSS_AGENT_OPENCODE_AGENT=cross-agent-reviewer` (see below). With that set, every `read_only=True` call asks opencode to use that agent.
+### Recommended: a generic read-only opencode agent
+
+By default the opencode backend sends no `agent` field, so `read_only=True` calls use opencode's default agent and rely on the caller's prompt to stay read-only. For enforced tool permissions, define a read-only agent in `opencode.json` and point the backend at it:
+
+```json
+{
+  "agent": {
+    "cross-agent-readonly": {
+      "description": "Generic non-interactive read-only agent for cross-agent MCP.",
+      "mode": "primary",
+      "permission": {
+        "*": "deny",
+        "read": {
+          "*": "allow",
+          "*.env": "deny",
+          "*.env.*": "deny",
+          "*.env.example": "allow"
+        },
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "external_directory": "allow"
+      }
+    }
+  }
+}
+```
+
+Then set `CROSS_AGENT_OPENCODE_AGENT=cross-agent-readonly` in the MCP launcher's environment, as shown in all three client examples above. With that set, every `read_only=True` call asks opencode to use the generic profile; `read_only=False` continues to use opencode's default agent.
+
+This profile can read any non-denied path available to the opencode process and can research on the web. The `directory` argument sets the session's working context rather than a read boundary, so absolute paths outside it do not require interactive approval. The wildcard deny leaves file mutation, shell execution, subagents, interactive questions, skills, LSP, and MCP tools unavailable. Broad filesystem reads plus internet access are an intentional trust-boundary choice: use this profile only when the selected model and prompts may be trusted with readable local data.
 
 ## Environment variables
 
@@ -123,7 +137,7 @@ Then set `CROSS_AGENT_OPENCODE_AGENT=cross-agent-reviewer` (see below). With tha
 |---|---|---|
 | `CROSS_AGENT_OPENCODE_BASE_URL` | `http://127.0.0.1:4096` | opencode server URL. Include an explicit port when autoserve is enabled. |
 | `CROSS_AGENT_OPENCODE_AUTOSERVE` | `true` | Auto-start `opencode serve` if the server is unreachable |
-| `CROSS_AGENT_OPENCODE_AGENT` | _(empty)_ | opencode agent name to request for read-only calls; empty = use opencode's default agent |
+| `CROSS_AGENT_OPENCODE_AGENT` | _(empty)_ | opencode agent name to request for read-only calls; `cross-agent-readonly` is the recommended generic profile, while empty uses opencode's default agent |
 | `CROSS_AGENT_QUERY_TIMEOUT` | `1200` (20 min) | Query timeout in seconds for both backends |
 | `OPENCODE_SERVER_USERNAME` | unset | Optional basic-auth username for the opencode server |
 | `OPENCODE_SERVER_PASSWORD` | unset | Optional basic-auth password for the opencode server |
@@ -154,26 +168,26 @@ response text. Continue calls return only the response text. Abort calls return
 
 ### `<prefix>_prompt`
 
-Start a backend-native session. `read_only=True` is the default request mode. Claude enforces this with tool restrictions; opencode hard enforcement requires `CROSS_AGENT_OPENCODE_AGENT` to point at a read-only opencode agent. Returns the response text prefixed with the native session id, which can be passed to `<prefix>_continue` to resume from this MCP server or from the backend harness directly.
+Start a backend-native session. `read_only=True` is the default request mode. Claude enforces this with a non-interactive tool allowlist and explicit denials; opencode hard enforcement requires `CROSS_AGENT_OPENCODE_AGENT` to point at a read-only opencode agent. Returns the response text prefixed with the native session id, which can be passed to `<prefix>_continue` to resume from this MCP server or from the backend harness directly.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `prompt` | `str` | _(required)_ | The prompt text |
-| `read_only` | `bool` | `true` | Request read-only mode. Claude enforces tool restrictions; opencode requires a configured read-only agent for hard enforcement. |
-| `directory` | `str \| null` | `null` | Working directory for the call |
+| `read_only` | `bool` | `true` | Request read-only mode. Claude uses a fail-closed SDK permission mode; opencode requires a configured read-only agent for hard enforcement. |
+| `directory` | `str \| null` | `null` | Working context for the call; pass it again on continuation. Whether external paths are readable depends on the selected backend permission profile. |
 | `model` | `str \| null` | `null` | Model override. For opencode, a flat `provider/model` string like `wandb/zai-org/GLM-5.2` (split into `{providerID, modelID}`). For Claude, a model slug like `claude-sonnet-4`. |
 | `timeout` | `float \| null` | `null` | Query timeout in seconds; `null`, non-positive, and non-finite values use `CROSS_AGENT_QUERY_TIMEOUT` (package default: 1200s / 20 min). Set high for long reviews. |
 
 ### `<prefix>_continue`
 
-Continue an existing backend-native session by id. The id may come from `<prefix>_prompt` or from the underlying backend harness. `read_only=True` is requested by default, matching the prompt tool. Claude enforces that with tool restrictions; opencode hard enforcement still depends on a configured read-only opencode agent.
+Continue an existing backend-native session by id. The id may come from `<prefix>_prompt` or from the underlying backend harness. `read_only=True` is requested by default, matching the prompt tool. Claude enforces that with fail-closed tool restrictions; opencode hard enforcement still depends on a configured read-only opencode agent.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `session_id` | `str` | _(required)_ | Native backend session id returned from `<prefix>_prompt` or copied from the backend harness |
 | `prompt` | `str` | _(required)_ | The follow-up prompt |
-| `read_only` | `bool` | `true` | Request read-only mode. Claude enforces tool restrictions; opencode requires a configured read-only agent for hard enforcement. |
-| `directory` | `str \| null` | `null` | Working directory for the call |
+| `read_only` | `bool` | `true` | Request read-only mode. Claude uses a fail-closed SDK permission mode; opencode requires a configured read-only agent for hard enforcement. |
+| `directory` | `str \| null` | `null` | Working context for the call; pass the same context again on continuation. |
 | `timeout` | `float \| null` | `null` | Query timeout in seconds; `null`, non-positive, and non-finite values use `CROSS_AGENT_QUERY_TIMEOUT` (package default: 1200s / 20 min). |
 
 ### `<prefix>_abort`
@@ -195,7 +209,7 @@ Call mcp__cross-agent__opencode_prompt with:
 - directory: "/Users/you/myproject"
 ```
 
-The response comes back prefixed with the opencode session id. With `CROSS_AGENT_OPENCODE_AGENT` set to a read-only opencode agent, GLM-5.2 reviews with sandboxed read/search access. Without that configuration, the MCP call requests read-only behavior but opencode's default agent permissions still apply.
+The response comes back prefixed with the opencode session id. With `CROSS_AGENT_OPENCODE_AGENT=cross-agent-readonly`, GLM-5.2 can read and search local or external paths and use web research without gaining mutation, shell, delegation, question, or MCP capabilities. Without that configuration, the MCP call requests read-only behavior but opencode's default agent permissions still apply.
 
 ### Ask Claude for a second opinion (from Codex)
 
@@ -246,7 +260,7 @@ so you can inspect, continue, stop, or delete it using the backend harness.
 
 ### Prompting tips
 
-The reviewing agent can explore your codebase on its own. Claude uses restricted read/search tools in `read_only=True`; opencode gets equivalent hard enforcement when you configure a read-only opencode agent. Keep prompts short and let the reviewer form its own understanding.
+The other agent can explore the relevant context on its own. Claude uses restricted read/search/web tools in `read_only=True`; opencode gets equivalent hard enforcement when you configure the generic read-only agent. Keep prompts short and let the model form its own understanding.
 
 - **Give paths, not diffs.** Say "Review `src/auth.py` for security issues" with the `directory` parameter set, not "Review this diff: ```diff ... 200 lines ...```". The reviewer reads the files itself.
 - **Point at the change set.** For branch reviews, name the files or the commit range ("Review the changes in `src/session/` from the last 3 commits") rather than pasting the diff.
@@ -259,8 +273,8 @@ Large prompts waste tokens and context window on both sides. The reviewer is a c
 
 The server is a thin [FastMCP](https://gofastmcp.com) stdio server. At startup it detects which backends are available and registers their tools:
 
-- **opencode backend** drives a local `opencode serve` HTTP API over `httpx` (default `http://127.0.0.1:4096`). On the first call it health-checks the server and, if `CROSS_AGENT_OPENCODE_AUTOSERVE` is enabled, spawns `opencode serve` as a subprocess it owns and tears it down on shutdown. Read-only calls optionally request a configured read-only opencode agent. The backend leaves successful prompt sessions durable in opencode, sanitizes the `directory` value before it lands in an HTTP header (stripping NUL/CR/LF to prevent header injection), URL-encodes session ids in request paths, and redacts secret-like patterns (`sk-...`, `sk_live_...`, `ghp_...`, `github_pat_...`, `hf_...`, `xox...`, `whsec_...`, long hex/base64 blobs) from response text before it reaches the MCP client.
-- **Claude backend** drives `claude-agent-sdk`, which spawns the `claude` CLI in-process and inherits the calling environment, so it reuses the CLI's stored enterprise auth with no API key. Read-only calls restrict the model to `Read`, `Glob`, `Grep`, `LS`, `WebSearch`, `WebFetch` and disallow `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, and `Bash`. Running sessions are tracked by asyncio task so `abort` can cancel an in-flight call, falling back to `claude stop <session_id>` for already-finished sessions.
+- **opencode backend** drives a local `opencode serve` HTTP API over `httpx` (default `http://127.0.0.1:4096`). On the first call it health-checks the server and, if `CROSS_AGENT_OPENCODE_AUTOSERVE` is enabled, spawns `opencode serve` as a subprocess it owns and tears it down on shutdown. Read-only calls optionally request a configured read-only opencode agent. While a message is running, the backend watches OpenCode's pending-permission endpoint for that exact native session. A matching unattended request cancels and aborts the session immediately and returns the session id, permission, redacted patterns, and working context; OpenCode versions that return 404 or 405 retain the existing global-timeout fallback. The backend leaves successful prompt sessions durable in opencode, sanitizes the `directory` value before it lands in an HTTP header (stripping NUL/CR/LF to prevent header injection), URL-encodes session ids in request paths, and redacts secret-like patterns (`sk-...`, `sk_live_...`, `ghp_...`, `github_pat_...`, `hf_...`, `xox...`, `whsec_...`, long hex/base64 blobs) from response text before it reaches the MCP client.
+- **Claude backend** drives `claude-agent-sdk`, which spawns the `claude` CLI in-process and inherits the calling environment, so it reuses the CLI's stored enterprise auth with no API key. Read-only calls pre-approve `Read`, `Glob`, `Grep`, `LS`, `WebSearch`, and `WebFetch`; remove write, edit, shell, delegation, question, and MCP tools; and use the SDK's `dontAsk` mode so unmatched tools are denied instead of prompting. Running sessions are tracked by asyncio task so `abort` can cancel an in-flight call, falling back to `claude stop <session_id>` for already-finished sessions.
 
 Prompt calls create backend-native sessions that remain durable in the native
 harness. The MCP server only tracks in-flight calls for local cancellation and

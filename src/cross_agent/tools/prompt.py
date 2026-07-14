@@ -31,7 +31,12 @@ ReadOnlyArg = Annotated[
 ]
 DirectoryArg = Annotated[
     str | None,
-    Field(description="Working directory the backend should use for file reads and searches."),
+    Field(
+        description=(
+            "Working context for the backend call. External path access depends on the "
+            "selected backend permission profile."
+        )
+    ),
 ]
 ModelArg = Annotated[
     str | None,
@@ -117,7 +122,7 @@ def register_tools(mcp: FastMCP, backend: Backend) -> None:
 
     def _prompt_desc() -> str:
         return (
-            f"Start a native {prefix} session for adversarial review.\n\n"
+            f"Start a native {prefix} session for a cross-model conversation.\n\n"
             "Read-only is requested by default. Enforcement depends on the backend "
             "and configuration: Claude restricts tools directly; opencode requires a "
             "configured read-only agent for hard enforcement. Pass read_only=False "

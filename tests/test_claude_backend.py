@@ -91,6 +91,8 @@ async def test_prompt_read_only_sets_tool_restrictions(monkeypatch):
     opts = q.captured["options"]
     assert opts.allowed_tools == READ_ONLY_ALLOWED
     assert opts.disallowed_tools == READ_ONLY_DISALLOWED
+    assert opts.permission_mode == "dontAsk"
+    assert {"Agent", "Task", "AskUserQuestion", "mcp__*"} <= set(opts.disallowed_tools)
 
 
 async def test_prompt_read_only_false_omits_tool_restrictions(monkeypatch):
@@ -102,6 +104,7 @@ async def test_prompt_read_only_false_omits_tool_restrictions(monkeypatch):
     opts = q.captured["options"]
     assert not opts.allowed_tools
     assert not opts.disallowed_tools
+    assert opts.permission_mode is None
 
 
 async def test_prompt_passes_cwd_and_model(monkeypatch):

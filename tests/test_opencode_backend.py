@@ -11,6 +11,8 @@ from cross_agent.backends.opencode import (
     HEALTH_TIMEOUT,
     OpenCodeBackend,
     OpenCodeConfig,
+    PendingPermission,
+    _matching_permission,
     _parse_model,
     _redact,
     _sanitize_directory,
@@ -94,6 +96,40 @@ def test_redact_scrubs_known_secret_prefixes():
     assert "[REDACTED]" in _redact("hf_" + "c" * 30)
     assert "[REDACTED]" in _redact("xoxb-" + "d" * 20)
     assert _redact("plain text with no secrets") == "plain text with no secrets"
+
+
+def test_matching_permission_filters_session_and_malformed_records():
+    payload = [
+        {"sessionID": "ses_other", "permission": "bash", "patterns": ["git status"]},
+        {"sessionID": "ses_target", "permission": "read", "patterns": "not-a-list"},
+        {"sessionID": "ses_target", "permission": "external_directory", "patterns": ["/tmp"]},
+    ]
+
+    assert _matching_permission(payload, "ses_target") == PendingPermission(
+        permission="external_directory",
+        patterns=("/tmp",),
+    )
+    assert _matching_permission(payload, "ses_missing") is None
+    assert _matching_permission({"sessionID": "ses_target"}, "ses_target") is None
+
+
+def test_matching_permission_redacts_bounds_and_strips_control_characters():
+    secret = "sk-" + "a" * 40
+    payload = [
+        {
+            "sessionID": "ses_target",
+            "permission": "external\ndirectory",
+            "patterns": [secret, "x" * 250, "three", "four", "five", "six"],
+        }
+    ]
+
+    pending = _matching_permission(payload, "ses_target")
+    assert pending is not None
+    assert pending.permission == "externaldirectory"
+    assert pending.patterns[0] == "[REDACTED]"
+    assert pending.patterns[1].endswith("...")
+    assert len(pending.patterns[1]) == 203
+    assert pending.patterns[-1] == "... (1 more)"
 
 
 def test_config_from_env_reads_query_timeout(monkeypatch):
@@ -368,6 +404,239 @@ async def test_prompt_no_warning_when_agent_empty(make_backend):
     assert text == "clean response"
 
 
+# ----------------------------------------------------- permission monitoring
+
+
+async def test_matching_pending_permission_aborts_and_reports_session(monkeypatch):
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=False))
+    backend._ensure_server = monkeypatch_async(None)  # type: ignore[method-assign]
+    message_started = asyncio.Event()
+    message_cancelled = asyncio.Event()
+    abort_calls = 0
+    secret = "sk-" + "a" * 40
+
+    async def fake_request(method, path, *, json=None, headers=None, timeout=None):
+        nonlocal abort_calls
+        if path == "/session":
+            return httpx.Response(
+                200,
+                json={"id": "ses_permission"},
+                request=httpx.Request(method, "http://test/session"),
+            )
+        if method == "POST" and path.endswith("/message"):
+            message_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                message_cancelled.set()
+                raise
+        if method == "GET" and path == "/permission":
+            await message_started.wait()
+            assert headers == {"x-opencode-directory": "/tmp/work"}
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "sessionID": "ses_other",
+                        "permission": "bash",
+                        "patterns": ["git status"],
+                    },
+                    {
+                        "sessionID": "ses_permission",
+                        "permission": "external_directory",
+                        "patterns": [f"/tmp/{secret}"],
+                    },
+                ],
+                request=httpx.Request(method, "http://test/permission"),
+            )
+        if path.endswith("/abort"):
+            abort_calls += 1
+            return httpx.Response(200, json=True, request=httpx.Request(method, f"http://test{path}"))
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    backend._request = fake_request  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await backend.prompt("read it", directory="/tmp/work")
+
+    error = str(exc_info.value)
+    assert "opencode session ses_permission" in error
+    assert "external_directory" in error
+    assert "/tmp/work" in error
+    assert "[REDACTED]" in error
+    assert secret not in error
+    assert "native session was aborted" in error
+    assert abort_calls == 1
+    assert message_cancelled.is_set()
+    assert "ses_permission" not in backend._tasks
+    assert "ses_permission" not in backend._session_locks
+    assert "ses_permission" not in backend._session_lock_users
+
+
+async def test_unrelated_permission_does_not_interrupt_message(monkeypatch):
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=False))
+    backend._ensure_server = monkeypatch_async(None)  # type: ignore[method-assign]
+    permission_seen = asyncio.Event()
+
+    async def fake_request(method, path, *, json=None, headers=None, timeout=None):
+        if method == "GET" and path == "/permission":
+            permission_seen.set()
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "sessionID": "ses_other",
+                        "permission": "external_directory",
+                        "patterns": ["/tmp"],
+                    }
+                ],
+                request=httpx.Request(method, "http://test/permission"),
+            )
+        if method == "POST" and path.endswith("/message"):
+            await permission_seen.wait()
+            return httpx.Response(
+                200,
+                json={"parts": [{"type": "text", "text": "ok"}]},
+                request=httpx.Request(method, f"http://test{path}"),
+            )
+        if path.endswith("/abort"):
+            raise AssertionError("unrelated permission must not abort the session")
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    backend._request = fake_request  # type: ignore[method-assign]
+
+    assert await backend.continue_session("ses_target", "hello") == "ok"
+
+
+@pytest.mark.parametrize("status_code", [404, 405])
+async def test_unsupported_permission_endpoint_preserves_message_flow(monkeypatch, status_code):
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=False))
+    backend._ensure_server = monkeypatch_async(None)  # type: ignore[method-assign]
+    permission_checked = asyncio.Event()
+
+    async def fake_request(method, path, *, json=None, headers=None, timeout=None):
+        if method == "GET" and path == "/permission":
+            permission_checked.set()
+            return httpx.Response(
+                status_code,
+                request=httpx.Request(method, "http://test/permission"),
+            )
+        if method == "POST" and path.endswith("/message"):
+            await permission_checked.wait()
+            return httpx.Response(
+                200,
+                json={"parts": [{"type": "text", "text": "fallback"}]},
+                request=httpx.Request(method, f"http://test{path}"),
+            )
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    backend._request = fake_request  # type: ignore[method-assign]
+
+    assert await backend.continue_session("ses_old", "hello") == "fallback"
+
+
+async def test_permission_watcher_retries_transient_failure(monkeypatch):
+    monkeypatch.setattr("cross_agent.backends.opencode.PERMISSION_POLL_INTERVAL", 0)
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=False))
+    backend._ensure_server = monkeypatch_async(None)  # type: ignore[method-assign]
+    message_started = asyncio.Event()
+    permission_calls = 0
+    abort_calls = 0
+
+    async def fake_request(method, path, *, json=None, headers=None, timeout=None):
+        nonlocal permission_calls, abort_calls
+        if method == "POST" and path.endswith("/message"):
+            message_started.set()
+            await asyncio.Event().wait()
+        if method == "GET" and path == "/permission":
+            await message_started.wait()
+            permission_calls += 1
+            if permission_calls == 1:
+                return httpx.Response(
+                    503,
+                    request=httpx.Request(method, "http://test/permission"),
+                )
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "sessionID": "ses_retry",
+                        "permission": "question",
+                        "patterns": ["confirm"],
+                    }
+                ],
+                request=httpx.Request(method, "http://test/permission"),
+            )
+        if path.endswith("/abort"):
+            abort_calls += 1
+            return httpx.Response(200, json=True, request=httpx.Request(method, f"http://test{path}"))
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    backend._request = fake_request  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="unattended permission 'question'"):
+        await backend.continue_session("ses_retry", "hello", read_only=False)
+    assert permission_calls == 2
+    assert abort_calls == 1
+
+
+async def test_successful_message_cancels_permission_watcher(monkeypatch):
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=False))
+    backend._ensure_server = monkeypatch_async(None)  # type: ignore[method-assign]
+    permission_started = asyncio.Event()
+    permission_cancelled = asyncio.Event()
+
+    async def fake_request(method, path, *, json=None, headers=None, timeout=None):
+        if method == "GET" and path == "/permission":
+            permission_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                permission_cancelled.set()
+                raise
+        if method == "POST" and path.endswith("/message"):
+            await permission_started.wait()
+            return httpx.Response(
+                200,
+                json={"parts": [{"type": "text", "text": "done"}]},
+                request=httpx.Request(method, f"http://test{path}"),
+            )
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    backend._request = fake_request  # type: ignore[method-assign]
+
+    assert await backend.continue_session("ses_done", "hello") == "done"
+    assert permission_cancelled.is_set()
+
+
+async def test_completed_message_wins_permission_race(monkeypatch):
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=False))
+    backend._ensure_server = monkeypatch_async(None)  # type: ignore[method-assign]
+    abort_calls = 0
+
+    async def fake_request(method, path, *, json=None, headers=None, timeout=None):
+        nonlocal abort_calls
+        if method == "POST" and path.endswith("/message"):
+            return httpx.Response(
+                200,
+                json={"parts": [{"type": "text", "text": "completed"}]},
+                request=httpx.Request(method, f"http://test{path}"),
+            )
+        if path.endswith("/abort"):
+            abort_calls += 1
+            return httpx.Response(200, json=True, request=httpx.Request(method, f"http://test{path}"))
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    async def immediate_permission(session_id, *, directory):
+        return PendingPermission(permission="question", patterns=("confirm",))
+
+    backend._request = fake_request  # type: ignore[method-assign]
+    backend._watch_pending_permission = immediate_permission  # type: ignore[method-assign]
+
+    assert await backend.continue_session("ses_race", "hello") == "completed"
+    assert abort_calls == 0
+
+
 # ------------------------------------------------------------------ continue
 
 
@@ -442,7 +711,8 @@ async def test_continue_session_uses_config_default_timeout_when_none(monkeypatc
         headers=None,
         timeout=httpx.USE_CLIENT_DEFAULT,
     ):
-        captured_timeouts.append(timeout)
+        if path.endswith("/message"):
+            captured_timeouts.append(timeout)
         return httpx.Response(
             200,
             json={"parts": [{"type": "text", "text": "ok"}]},
@@ -472,7 +742,8 @@ async def test_continue_session_per_call_timeout_reaches_httpx(monkeypatch):
         headers=None,
         timeout=httpx.USE_CLIENT_DEFAULT,
     ):
-        captured_timeouts.append(timeout)
+        if path.endswith("/message"):
+            captured_timeouts.append(timeout)
         return httpx.Response(
             200,
             json={"parts": [{"type": "text", "text": "ok"}]},
@@ -502,7 +773,8 @@ async def test_continue_session_timeout_zero_falls_back_to_default(monkeypatch):
         headers=None,
         timeout=httpx.USE_CLIENT_DEFAULT,
     ):
-        captured_timeouts.append(timeout)
+        if path.endswith("/message"):
+            captured_timeouts.append(timeout)
         return httpx.Response(
             200,
             json={"parts": [{"type": "text", "text": "ok"}]},

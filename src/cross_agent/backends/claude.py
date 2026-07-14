@@ -21,10 +21,20 @@ from claude_agent_sdk import (
 
 from cross_agent.config import env_float, validate_timeout
 
-# Read-only toolset: pre-approve safe operations and remove write/bash entirely so
-# the model cannot mutate the working tree or shell out, even if it tries.
+# Read-only toolset: pre-approve safe operations and remove stateful, interactive,
+# and delegated tools entirely so loaded settings cannot re-enable them.
 READ_ONLY_ALLOWED = ["Read", "Glob", "Grep", "LS", "WebSearch", "WebFetch"]
-READ_ONLY_DISALLOWED = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"]
+READ_ONLY_DISALLOWED = [
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "Bash",
+    "Agent",
+    "Task",
+    "AskUserQuestion",
+    "mcp__*",
+]
 
 DEFAULT_QUERY_TIMEOUT = 1200.0
 TASK_DRAIN_TIMEOUT = 1.0
@@ -40,7 +50,7 @@ def _text_from_content(content: list[Any]) -> str:
 
 
 class ClaudeBackend:
-    """Backend wrapping ``claude-agent-sdk`` for cross-family review."""
+    """Backend wrapping ``claude-agent-sdk`` for cross-family conversations."""
 
     def __init__(self, model: str | None = None) -> None:
         self._model = model or os.environ.get("CROSS_AGENT_CLAUDE_MODEL")
@@ -70,6 +80,7 @@ class ClaudeBackend:
         if read_only:
             kwargs["allowed_tools"] = list(READ_ONLY_ALLOWED)
             kwargs["disallowed_tools"] = list(READ_ONLY_DISALLOWED)
+            kwargs["permission_mode"] = "dontAsk"
         if directory:
             kwargs["cwd"] = directory
         chosen = model or self._model

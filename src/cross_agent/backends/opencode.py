@@ -27,6 +27,10 @@ DEFAULT_QUERY_TIMEOUT = 1200.0
 HEALTH_TIMEOUT = 3.0
 AUTOSERVE_WAIT = 10.0
 AUTOSERVE_POLL = 0.5
+PERMISSION_POLL_INTERVAL = 0.25
+PERMISSION_REQUEST_TIMEOUT = 2.0
+MAX_PERMISSION_PATTERNS = 5
+MAX_PERMISSION_DETAIL_LENGTH = 200
 
 # Secret patterns scrubbed from response text before returning to the MCP client.
 # Mirrors the redactSecrets pattern from opencode-mcp to keep provider keys out
@@ -80,6 +84,12 @@ class OpenCodeConfig:
         )
 
 
+@dataclass(frozen=True)
+class PendingPermission:
+    permission: str
+    patterns: tuple[str, ...]
+
+
 def _sanitize_directory(directory: str | None) -> str | None:
     """Strip NUL/CR/LF from a directory before it lands in an HTTP header."""
     if directory is None:
@@ -94,6 +104,43 @@ def _redact(text: str) -> str:
     for pattern in _SECRET_PATTERNS:
         redacted = pattern.sub("[REDACTED]", redacted)
     return redacted
+
+
+def _safe_permission_detail(value: str) -> str:
+    """Redact and bound a permission field before including it in an error."""
+    cleaned = _HEADER_STRIP.sub("", value)
+    redacted = _redact(cleaned)
+    if len(redacted) <= MAX_PERMISSION_DETAIL_LENGTH:
+        return redacted
+    return f"{redacted[:MAX_PERMISSION_DETAIL_LENGTH]}..."
+
+
+def _matching_permission(payload: Any, session_id: str) -> PendingPermission | None:
+    """Return a well-formed pending permission for the requested session."""
+    if not isinstance(payload, list):
+        return None
+    for record in payload:
+        if not isinstance(record, dict) or record.get("sessionID") != session_id:
+            continue
+        permission = record.get("permission")
+        patterns = record.get("patterns")
+        if (
+            not isinstance(permission, str)
+            or not permission
+            or not isinstance(patterns, list)
+            or not all(isinstance(pattern, str) for pattern in patterns)
+        ):
+            continue
+        safe_patterns = tuple(
+            _safe_permission_detail(pattern) for pattern in patterns[:MAX_PERMISSION_PATTERNS]
+        )
+        if len(patterns) > MAX_PERMISSION_PATTERNS:
+            safe_patterns += (f"... ({len(patterns) - MAX_PERMISSION_PATTERNS} more)",)
+        return PendingPermission(
+            permission=_safe_permission_detail(permission),
+            patterns=safe_patterns,
+        )
+    return None
 
 
 def _parse_model(model: str | None) -> dict[str, str] | None:
@@ -339,6 +386,85 @@ class OpenCodeBackend:
             except Exception:
                 pass
 
+    async def _watch_pending_permission(
+        self,
+        session_id: str,
+        *,
+        directory: str | None,
+    ) -> PendingPermission | None:
+        """Poll for this session's pending permission, or return None if unsupported."""
+        request_timeout = httpx.Timeout(
+            PERMISSION_REQUEST_TIMEOUT,
+            connect=PERMISSION_REQUEST_TIMEOUT,
+        )
+        headers = self._dir_headers(directory)
+        while True:
+            try:
+                response = await self._request(
+                    "GET",
+                    "/permission",
+                    headers=headers,
+                    timeout=request_timeout,
+                )
+                if response.status_code in (404, 405):
+                    return None
+                response.raise_for_status()
+                pending = _matching_permission(response.json(), session_id)
+                if pending is not None:
+                    return pending
+            except (httpx.HTTPError, ValueError):
+                # Permission monitoring must not fail an otherwise healthy message.
+                pass
+            await asyncio.sleep(PERMISSION_POLL_INTERVAL)
+
+    async def _request_message_with_permission_watch(
+        self,
+        session_id: str,
+        path: str,
+        *,
+        body: dict[str, Any],
+        directory: str | None,
+        timeout: httpx.Timeout,
+    ) -> httpx.Response:
+        """Race a message request against unattended permission detection."""
+        headers = self._dir_headers(directory)
+        message_task = asyncio.create_task(
+            self._request("POST", path, json=body, headers=headers, timeout=timeout)
+        )
+        permission_task = asyncio.create_task(
+            self._watch_pending_permission(session_id, directory=directory)
+        )
+        tasks = [message_task, permission_task]
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if message_task in done:
+                return await message_task
+
+            pending = await permission_task
+            if pending is None or message_task.done():
+                return await message_task
+
+            message_task.cancel()
+            await self._drain_cancelled_tasks([message_task])
+            try:
+                await self._abort_native(session_id)
+            except httpx.HTTPError:
+                pass
+
+            directory_context = _safe_permission_detail(
+                _sanitize_directory(directory) or "<default>"
+            )
+            raise RuntimeError(
+                f"opencode session {session_id} requires unattended permission "
+                f"{pending.permission!r} for patterns {list(pending.patterns)!r} "
+                f"in directory {directory_context!r}; the native session was aborted"
+            )
+        finally:
+            unfinished = [task for task in tasks if not task.done()]
+            for task in unfinished:
+                task.cancel()
+            await self._drain_cancelled_tasks(unfinished)
+
     async def _send_message(
         self,
         session_id: str,
@@ -394,13 +520,16 @@ class OpenCodeBackend:
         if model_obj:
             body["model"] = model_obj
 
-        dir_headers = self._dir_headers(directory)
         msg_path = self._session_path(session_id, "/message")
         effective_timeout = validate_timeout(timeout, self.config.query_timeout)
         request_timeout = httpx.Timeout(effective_timeout, connect=5.0)
         try:
-            resp = await self._request(
-                "POST", msg_path, json=body, headers=dir_headers, timeout=request_timeout
+            resp = await self._request_message_with_permission_watch(
+                session_id,
+                msg_path,
+                body=body,
+                directory=directory,
+                timeout=request_timeout,
             )
         except (httpx.TimeoutException, asyncio.CancelledError):
             try:
