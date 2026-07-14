@@ -97,7 +97,7 @@ Add to the `"mcp"` block in your `opencode.json`:
 
 ### Recommended: a generic read-only opencode agent
 
-By default the opencode backend sends no `agent` field, so `read_only=True` calls use opencode's default agent and rely on the caller's prompt to stay read-only. For enforced tool permissions, define a read-only agent in `opencode.json` and point the backend at it:
+By default the opencode backend sends no `agent` field, so `read_only=True` calls use opencode's default agent and rely on the caller's prompt to stay read-only. For practical non-interactive guardrails in trusted repositories, define a read-only agent in `opencode.json` and point the backend at it:
 
 ```json
 {
@@ -111,7 +111,8 @@ By default the opencode backend sends no `agent` field, so `read_only=True` call
           "*": "allow",
           "*.env": "deny",
           "*.env.*": "deny",
-          "*.env.example": "allow"
+          "*.env.example": "allow",
+          "mcp:*": "deny"
         },
         "glob": "allow",
         "grep": "allow",
@@ -127,7 +128,9 @@ By default the opencode backend sends no `agent` field, so `read_only=True` call
 
 Then set `CROSS_AGENT_OPENCODE_AGENT=cross-agent-readonly` in the MCP launcher's environment, as shown in all three client examples above. With that set, every `read_only=True` call asks opencode to use the generic profile; `read_only=False` continues to use opencode's default agent.
 
-This profile can read any non-denied path available to the opencode process and can research on the web. The `directory` argument sets the session's working context rather than a read boundary, so absolute paths outside it do not require interactive approval. The wildcard deny leaves file mutation, shell execution, subagents, interactive questions, skills, LSP, and MCP tools unavailable. Broad filesystem reads plus internet access are an intentional trust-boundary choice: use this profile only when the selected model and prompts may be trusted with readable local data.
+This profile can read broadly available paths and use provider-available web tools. The `directory` argument sets the session's working context rather than a read boundary, so absolute paths outside it do not require interactive approval. The wildcard deny blocks ordinary file mutation, shell execution, subagents, interactive questions, skills, LSP, and MCP tools; the `mcp:*` read rule also blocks OpenCode's MCP resource operations. `websearch` is available only when the selected OpenCode provider registers it, while `webfetch` can still retrieve known URLs.
+
+This is a best-effort profile for trusted repositories and trusted OpenCode configuration, not a security sandbox. Repository-local OpenCode configuration, tools, or plugins can affect the resolved agent. The `.env` rules block direct `read` calls as defense in depth, but unrestricted `grep` and other read-oriented capabilities can still expose readable data. Broad reads plus internet access therefore do not provide a secret-confidentiality boundary.
 
 ## Environment variables
 
@@ -168,25 +171,25 @@ response text. Continue calls return only the response text. Abort calls return
 
 ### `<prefix>_prompt`
 
-Start a backend-native session. `read_only=True` is the default request mode. Claude enforces this with a non-interactive tool allowlist and explicit denials; opencode hard enforcement requires `CROSS_AGENT_OPENCODE_AGENT` to point at a read-only opencode agent. Returns the response text prefixed with the native session id, which can be passed to `<prefix>_continue` to resume from this MCP server or from the backend harness directly.
+Start a backend-native session. `read_only=True` is the default request mode. Claude uses an isolated non-interactive tool allowlist; opencode practical enforcement requires `CROSS_AGENT_OPENCODE_AGENT` to point at a read-only opencode agent. Returns the response text prefixed with the native session id, which can be passed to `<prefix>_continue` to resume from this MCP server or from the backend harness directly.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `prompt` | `str` | _(required)_ | The prompt text |
-| `read_only` | `bool` | `true` | Request read-only mode. Claude uses a fail-closed SDK permission mode; opencode requires a configured read-only agent for hard enforcement. |
+| `read_only` | `bool` | `true` | Request read-only mode. Claude uses isolated SDK tools and a fail-closed permission mode; opencode requires a configured read-only agent and trusted repository configuration. |
 | `directory` | `str \| null` | `null` | Working context for the call; pass it again on continuation. Whether external paths are readable depends on the selected backend permission profile. |
 | `model` | `str \| null` | `null` | Model override. For opencode, a flat `provider/model` string like `wandb/zai-org/GLM-5.2` (split into `{providerID, modelID}`). For Claude, a model slug like `claude-sonnet-4`. |
 | `timeout` | `float \| null` | `null` | Query timeout in seconds; `null`, non-positive, and non-finite values use `CROSS_AGENT_QUERY_TIMEOUT` (package default: 1200s / 20 min). Set high for long reviews. |
 
 ### `<prefix>_continue`
 
-Continue an existing backend-native session by id. The id may come from `<prefix>_prompt` or from the underlying backend harness. `read_only=True` is requested by default, matching the prompt tool. Claude enforces that with fail-closed tool restrictions; opencode hard enforcement still depends on a configured read-only opencode agent.
+Continue an existing backend-native session by id. The id may come from `<prefix>_prompt` or from the underlying backend harness. `read_only=True` is requested by default, matching the prompt tool. Claude uses isolated fail-closed tool restrictions; opencode practical enforcement still depends on a configured read-only opencode agent and trusted repository configuration.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `session_id` | `str` | _(required)_ | Native backend session id returned from `<prefix>_prompt` or copied from the backend harness |
 | `prompt` | `str` | _(required)_ | The follow-up prompt |
-| `read_only` | `bool` | `true` | Request read-only mode. Claude uses a fail-closed SDK permission mode; opencode requires a configured read-only agent for hard enforcement. |
+| `read_only` | `bool` | `true` | Request read-only mode. Claude uses isolated SDK tools and a fail-closed permission mode; opencode requires a configured read-only agent and trusted repository configuration. |
 | `directory` | `str \| null` | `null` | Working context for the call; pass the same context again on continuation. |
 | `timeout` | `float \| null` | `null` | Query timeout in seconds; `null`, non-positive, and non-finite values use `CROSS_AGENT_QUERY_TIMEOUT` (package default: 1200s / 20 min). |
 
@@ -209,7 +212,7 @@ Call mcp__cross-agent__opencode_prompt with:
 - directory: "/Users/you/myproject"
 ```
 
-The response comes back prefixed with the opencode session id. With `CROSS_AGENT_OPENCODE_AGENT=cross-agent-readonly`, GLM-5.2 can read and search local or external paths and use web research without gaining mutation, shell, delegation, question, or MCP capabilities. Without that configuration, the MCP call requests read-only behavior but opencode's default agent permissions still apply.
+The response comes back prefixed with the opencode session id. With `CROSS_AGENT_OPENCODE_AGENT=cross-agent-readonly`, the resolved profile denies mutation, shell, delegation, question, and MCP capabilities while allowing broad reads and provider-available web research. This assumes trusted repository-local OpenCode configuration. Without the profile, the MCP call requests read-only behavior but opencode's default agent permissions still apply.
 
 ### Ask Claude for a second opinion (from Codex)
 
@@ -260,7 +263,7 @@ so you can inspect, continue, stop, or delete it using the backend harness.
 
 ### Prompting tips
 
-The other agent can explore the relevant context on its own. Claude uses restricted read/search/web tools in `read_only=True`; opencode gets equivalent hard enforcement when you configure the generic read-only agent. Keep prompts short and let the model form its own understanding.
+The other agent can explore the relevant context on its own. Claude uses an isolated read/search/web tool surface in `read_only=True`; opencode gets practical non-interactive guardrails when you configure the generic read-only agent for a trusted repository. Keep prompts short and let the model form its own understanding.
 
 - **Give paths, not diffs.** Say "Review `src/auth.py` for security issues" with the `directory` parameter set, not "Review this diff: ```diff ... 200 lines ...```". The reviewer reads the files itself.
 - **Point at the change set.** For branch reviews, name the files or the commit range ("Review the changes in `src/session/` from the last 3 commits") rather than pasting the diff.
@@ -273,8 +276,8 @@ Large prompts waste tokens and context window on both sides. The reviewer is a c
 
 The server is a thin [FastMCP](https://gofastmcp.com) stdio server. At startup it detects which backends are available and registers their tools:
 
-- **opencode backend** drives a local `opencode serve` HTTP API over `httpx` (default `http://127.0.0.1:4096`). On the first call it health-checks the server and, if `CROSS_AGENT_OPENCODE_AUTOSERVE` is enabled, spawns `opencode serve` as a subprocess it owns and tears it down on shutdown. Read-only calls optionally request a configured read-only opencode agent. While a message is running, the backend watches OpenCode's pending-permission endpoint for that exact native session. A matching unattended request cancels and aborts the session immediately and returns the session id, permission, redacted patterns, and working context; OpenCode versions that return 404 or 405 retain the existing global-timeout fallback. The backend leaves successful prompt sessions durable in opencode, sanitizes the `directory` value before it lands in an HTTP header (stripping NUL/CR/LF to prevent header injection), URL-encodes session ids in request paths, and redacts secret-like patterns (`sk-...`, `sk_live_...`, `ghp_...`, `github_pat_...`, `hf_...`, `xox...`, `whsec_...`, long hex/base64 blobs) from response text before it reaches the MCP client.
-- **Claude backend** drives `claude-agent-sdk`, which spawns the `claude` CLI in-process and inherits the calling environment, so it reuses the CLI's stored enterprise auth with no API key. Read-only calls pre-approve `Read`, `Glob`, `Grep`, `LS`, `WebSearch`, and `WebFetch`; remove write, edit, shell, delegation, question, and MCP tools; and use the SDK's `dontAsk` mode so unmatched tools are denied instead of prompting. Running sessions are tracked by asyncio task so `abort` can cancel an in-flight call, falling back to `claude stop <session_id>` for already-finished sessions.
+- **opencode backend** drives a local `opencode serve` HTTP API over `httpx` (default `http://127.0.0.1:4096`). On the first call it health-checks the server and, if `CROSS_AGENT_OPENCODE_AUTOSERVE` is enabled, spawns `opencode serve` as a subprocess it owns and tears it down on shutdown. Read-only calls optionally request a configured read-only opencode agent. While a message is running, the backend watches OpenCode's pending-permission endpoint for that exact native session. A matching unattended request cancels the message, attempts a native abort, and returns the session id, permission, pattern count, working context, and whether abort was confirmed; raw permission patterns are not returned. OpenCode versions that return 404 or 405 retain the existing global-timeout fallback. The backend leaves successful prompt sessions durable in opencode, sanitizes the `directory` value before it lands in an HTTP header (stripping NUL/CR/LF to prevent header injection), URL-encodes session ids in request paths, and redacts secret-like patterns (`sk-...`, `sk_live_...`, `ghp_...`, `github_pat_...`, `hf_...`, `xox...`, `whsec_...`, long hex/base64 blobs) from response text before it reaches the MCP client.
+- **Claude backend** drives `claude-agent-sdk`, which spawns the `claude` CLI in-process and inherits the calling environment, so it reuses the CLI's stored enterprise auth with no API key. Read-only calls expose and pre-approve only `Read`, `Glob`, `Grep`, `LS`, `WebSearch`, and `WebFetch`; use the SDK's `dontAsk` mode; disable filesystem setting sources and skills; and ignore inherited MCP configuration. This isolation means CLAUDE.md and filesystem settings are not loaded automatically for read-only calls, although the model can read relevant instruction files as ordinary context when directed. Running sessions are tracked by asyncio task so `abort` can cancel an in-flight call, falling back to `claude stop <session_id>` for already-finished sessions.
 
 Prompt calls create backend-native sessions that remain durable in the native
 harness. The MCP server only tracks in-flight calls for local cancellation and

@@ -89,10 +89,17 @@ async def test_prompt_read_only_sets_tool_restrictions(monkeypatch):
     backend = ClaudeBackend()
     await backend.prompt("review", read_only=True)
     opts = q.captured["options"]
-    assert opts.allowed_tools == READ_ONLY_ALLOWED
+    expected_tools = ["Read", "Glob", "Grep", "LS", "WebSearch", "WebFetch"]
+    assert READ_ONLY_ALLOWED == expected_tools
+    assert opts.tools == expected_tools
+    assert opts.allowed_tools == expected_tools
     assert opts.disallowed_tools == READ_ONLY_DISALLOWED
     assert opts.permission_mode == "dontAsk"
-    assert {"Agent", "Task", "AskUserQuestion", "mcp__*"} <= set(opts.disallowed_tools)
+    assert opts.setting_sources == []
+    assert opts.strict_mcp_config is True
+    assert opts.mcp_servers == {}
+    assert opts.skills == []
+    assert opts.disallowed_tools == ["mcp__*"]
 
 
 async def test_prompt_read_only_false_omits_tool_restrictions(monkeypatch):
@@ -102,9 +109,14 @@ async def test_prompt_read_only_false_omits_tool_restrictions(monkeypatch):
     backend = ClaudeBackend()
     await backend.prompt("do work", read_only=False)
     opts = q.captured["options"]
+    assert opts.tools is None
     assert not opts.allowed_tools
     assert not opts.disallowed_tools
     assert opts.permission_mode is None
+    assert opts.setting_sources is None
+    assert opts.strict_mcp_config is False
+    assert opts.mcp_servers == {}
+    assert opts.skills is None
 
 
 async def test_prompt_passes_cwd_and_model(monkeypatch):

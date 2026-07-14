@@ -29,7 +29,6 @@ AUTOSERVE_WAIT = 10.0
 AUTOSERVE_POLL = 0.5
 PERMISSION_POLL_INTERVAL = 0.25
 PERMISSION_REQUEST_TIMEOUT = 2.0
-MAX_PERMISSION_PATTERNS = 5
 MAX_PERMISSION_DETAIL_LENGTH = 200
 
 # Secret patterns scrubbed from response text before returning to the MCP client.
@@ -87,7 +86,7 @@ class OpenCodeConfig:
 @dataclass(frozen=True)
 class PendingPermission:
     permission: str
-    patterns: tuple[str, ...]
+    pattern_count: int
 
 
 def _sanitize_directory(directory: str | None) -> str | None:
@@ -131,14 +130,9 @@ def _matching_permission(payload: Any, session_id: str) -> PendingPermission | N
             or not all(isinstance(pattern, str) for pattern in patterns)
         ):
             continue
-        safe_patterns = tuple(
-            _safe_permission_detail(pattern) for pattern in patterns[:MAX_PERMISSION_PATTERNS]
-        )
-        if len(patterns) > MAX_PERMISSION_PATTERNS:
-            safe_patterns += (f"... ({len(patterns) - MAX_PERMISSION_PATTERNS} more)",)
         return PendingPermission(
             permission=_safe_permission_detail(permission),
-            patterns=safe_patterns,
+            pattern_count=len(patterns),
         )
     return None
 
@@ -357,15 +351,18 @@ class OpenCodeBackend:
         if not tasks:
             self._tasks.pop(session_id, None)
 
-    async def _abort_native(self, session_id: str) -> None:
+    async def _abort_native(self, session_id: str) -> bool:
+        """Abort a native session, returning whether the abort itself was confirmed."""
         resp = await self._request(
             "POST",
             self._session_path(session_id, "/abort"),
             timeout=httpx.Timeout(HEALTH_TIMEOUT, connect=HEALTH_TIMEOUT),
         )
-        # 404 means the session already finished; treat as success.
-        if resp.status_code not in (200, 404):
+        if resp.status_code == 404:
+            return False
+        if resp.status_code != 200:
             resp.raise_for_status()
+        return True
 
     def _cancel_tasks(self, session_id: str) -> list[asyncio.Task[Any]]:
         tasks = list(self._tasks.get(session_id, ()))
@@ -445,25 +442,32 @@ class OpenCodeBackend:
                 return await message_task
 
             message_task.cancel()
-            await self._drain_cancelled_tasks([message_task])
             try:
-                await self._abort_native(session_id)
+                abort_confirmed = await self._abort_native(session_id)
             except httpx.HTTPError:
-                pass
+                abort_status = (
+                    "the local message was cancelled, but native abort could not be confirmed"
+                )
+            else:
+                if abort_confirmed:
+                    abort_status = "the native session was aborted"
+                else:
+                    abort_status = "the native session was not found; abort was not confirmed"
 
             directory_context = _safe_permission_detail(
                 _sanitize_directory(directory) or "<default>"
             )
+            pattern_label = "pattern" if pending.pattern_count == 1 else "patterns"
             raise RuntimeError(
                 f"opencode session {session_id} requires unattended permission "
-                f"{pending.permission!r} for patterns {list(pending.patterns)!r} "
-                f"in directory {directory_context!r}; the native session was aborted"
+                f"{pending.permission!r} for {pending.pattern_count} {pattern_label} "
+                f"in directory {directory_context!r}; {abort_status}"
             )
         finally:
             unfinished = [task for task in tasks if not task.done()]
             for task in unfinished:
                 task.cancel()
-            await self._drain_cancelled_tasks(unfinished)
+            await self._drain_cancelled_tasks(tasks)
 
     async def _send_message(
         self,

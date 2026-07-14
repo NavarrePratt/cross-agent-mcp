@@ -107,29 +107,29 @@ def test_matching_permission_filters_session_and_malformed_records():
 
     assert _matching_permission(payload, "ses_target") == PendingPermission(
         permission="external_directory",
-        patterns=("/tmp",),
+        pattern_count=1,
     )
     assert _matching_permission(payload, "ses_missing") is None
     assert _matching_permission({"sessionID": "ses_target"}, "ses_target") is None
 
 
-def test_matching_permission_redacts_bounds_and_strips_control_characters():
-    secret = "sk-" + "a" * 40
+def test_matching_permission_bounds_name_and_counts_patterns_without_retaining_values():
+    secret = "https://example.test/?token=top-secret-value"
     payload = [
         {
             "sessionID": "ses_target",
-            "permission": "external\ndirectory",
-            "patterns": [secret, "x" * 250, "three", "four", "five", "six"],
+            "permission": "external\ndirectory" + "x" * 250,
+            "patterns": [secret, "two", "three", "four", "five", "six"],
         }
     ]
 
     pending = _matching_permission(payload, "ses_target")
     assert pending is not None
-    assert pending.permission == "externaldirectory"
-    assert pending.patterns[0] == "[REDACTED]"
-    assert pending.patterns[1].endswith("...")
-    assert len(pending.patterns[1]) == 203
-    assert pending.patterns[-1] == "... (1 more)"
+    assert pending.permission.startswith("externaldirectory")
+    assert pending.permission.endswith("...")
+    assert len(pending.permission) == 203
+    assert pending.pattern_count == 6
+    assert secret not in repr(pending)
 
 
 def test_config_from_env_reads_query_timeout(monkeypatch):
@@ -413,7 +413,8 @@ async def test_matching_pending_permission_aborts_and_reports_session(monkeypatc
     message_started = asyncio.Event()
     message_cancelled = asyncio.Event()
     abort_calls = 0
-    secret = "sk-" + "a" * 40
+    drain_calls = []
+    secret = "https://example.test/?token=top-secret-value"
 
     async def fake_request(method, path, *, json=None, headers=None, timeout=None):
         nonlocal abort_calls
@@ -455,6 +456,13 @@ async def test_matching_pending_permission_aborts_and_reports_session(monkeypatc
         raise AssertionError(f"unexpected request: {method} {path}")
 
     backend._request = fake_request  # type: ignore[method-assign]
+    original_drain = backend._drain_cancelled_tasks
+
+    async def recording_drain(tasks):
+        drain_calls.append(list(tasks))
+        await original_drain(tasks)
+
+    backend._drain_cancelled_tasks = recording_drain  # type: ignore[method-assign]
 
     with pytest.raises(RuntimeError) as exc_info:
         await backend.prompt("read it", directory="/tmp/work")
@@ -463,14 +471,66 @@ async def test_matching_pending_permission_aborts_and_reports_session(monkeypatc
     assert "opencode session ses_permission" in error
     assert "external_directory" in error
     assert "/tmp/work" in error
-    assert "[REDACTED]" in error
+    assert "for 1 pattern" in error
     assert secret not in error
     assert "native session was aborted" in error
     assert abort_calls == 1
+    assert len(drain_calls) == 1
+    assert len(drain_calls[0]) == 2
     assert message_cancelled.is_set()
     assert "ses_permission" not in backend._tasks
     assert "ses_permission" not in backend._session_locks
     assert "ses_permission" not in backend._session_lock_users
+
+
+@pytest.mark.parametrize(
+    ("abort_status", "expected_error"),
+    [
+        (500, "native abort could not be confirmed"),
+        (404, "native session was not found; abort was not confirmed"),
+    ],
+)
+async def test_matching_pending_permission_reports_unconfirmed_native_abort(
+    monkeypatch,
+    abort_status,
+    expected_error,
+):
+    backend = OpenCodeBackend(OpenCodeConfig(base_url="http://127.0.0.1:4096", autoserve=False))
+    backend._ensure_server = monkeypatch_async(None)  # type: ignore[method-assign]
+    message_started = asyncio.Event()
+    message_cancelled = asyncio.Event()
+
+    async def fake_request(method, path, *, json=None, headers=None, timeout=None):
+        if method == "POST" and path.endswith("/message"):
+            message_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                message_cancelled.set()
+                raise
+        if path.endswith("/abort"):
+            return httpx.Response(
+                abort_status,
+                request=httpx.Request(method, f"http://test{path}"),
+            )
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    async def matching_permission(session_id, *, directory):
+        await message_started.wait()
+        return PendingPermission(permission="question", pattern_count=2)
+
+    backend._request = fake_request  # type: ignore[method-assign]
+    backend._watch_pending_permission = matching_permission  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await backend.continue_session("ses_abort_failed", "hello")
+
+    error = str(exc_info.value)
+    assert "opencode session ses_abort_failed" in error
+    assert "for 2 patterns" in error
+    assert expected_error in error
+    assert "the native session was aborted" not in error
+    assert message_cancelled.is_set()
 
 
 async def test_unrelated_permission_does_not_interrupt_message(monkeypatch):
@@ -628,7 +688,7 @@ async def test_completed_message_wins_permission_race(monkeypatch):
         raise AssertionError(f"unexpected request: {method} {path}")
 
     async def immediate_permission(session_id, *, directory):
-        return PendingPermission(permission="question", patterns=("confirm",))
+        return PendingPermission(permission="question", pattern_count=1)
 
     backend._request = fake_request  # type: ignore[method-assign]
     backend._watch_pending_permission = immediate_permission  # type: ignore[method-assign]

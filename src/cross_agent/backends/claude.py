@@ -21,20 +21,10 @@ from claude_agent_sdk import (
 
 from cross_agent.config import env_float, validate_timeout
 
-# Read-only toolset: pre-approve safe operations and remove stateful, interactive,
-# and delegated tools entirely so loaded settings cannot re-enable them.
+# Read-only toolset: expose and pre-approve only read/search/web built-ins. MCP tools
+# are separate from the built-in availability list and remain explicitly denied.
 READ_ONLY_ALLOWED = ["Read", "Glob", "Grep", "LS", "WebSearch", "WebFetch"]
-READ_ONLY_DISALLOWED = [
-    "Write",
-    "Edit",
-    "MultiEdit",
-    "NotebookEdit",
-    "Bash",
-    "Agent",
-    "Task",
-    "AskUserQuestion",
-    "mcp__*",
-]
+READ_ONLY_DISALLOWED = ["mcp__*"]
 
 DEFAULT_QUERY_TIMEOUT = 1200.0
 TASK_DRAIN_TIMEOUT = 1.0
@@ -78,9 +68,14 @@ class ClaudeBackend:
     ) -> ClaudeAgentOptions:
         kwargs: dict[str, Any] = {}
         if read_only:
+            kwargs["tools"] = list(READ_ONLY_ALLOWED)
             kwargs["allowed_tools"] = list(READ_ONLY_ALLOWED)
             kwargs["disallowed_tools"] = list(READ_ONLY_DISALLOWED)
             kwargs["permission_mode"] = "dontAsk"
+            kwargs["setting_sources"] = []
+            kwargs["strict_mcp_config"] = True
+            kwargs["mcp_servers"] = {}
+            kwargs["skills"] = []
         if directory:
             kwargs["cwd"] = directory
         chosen = model or self._model
