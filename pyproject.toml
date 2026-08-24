@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "npratt" }]
 dependencies = [
-    "mcp[cli]>=1.0",
+    "mcp[cli]>=1.28,<2",
     "httpx>=0.27",
 ]
 
