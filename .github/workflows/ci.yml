@@ -25,3 +25,6 @@ jobs:
 
       - name: Pytest (unit)
         run: uv run pytest -m "not integration"
+
+      - name: Fresh-install startup smoke test
+        run: timeout 180s uv run python scripts/verify_live.py --startup-only

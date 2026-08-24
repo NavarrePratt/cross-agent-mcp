@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 
 import pytest
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 from cross_agent.server import build_server, get_available_backends
 from cross_agent.tools.prompt import _call_continue, _call_prompt, register_tools
@@ -213,9 +213,9 @@ def _tool_names(mcp) -> list[str]:
     return [t.name for t in asyncio.run(mcp.list_tools())]
 
 
-async def _call_tool_text(mcp: FastMCP, name: str, arguments: dict[str, object]) -> str:
-    content, _ = await mcp.call_tool(name, arguments)
-    return "\n".join(item.text for item in content)
+async def _call_tool_text(mcp: MCPServer, name: str, arguments: dict[str, object]) -> str:
+    result = await mcp.call_tool(name, arguments)
+    return "\n".join(item.text for item in result.content)
 
 
 def test_opencode_tools_always_register():
@@ -293,9 +293,9 @@ def test_tool_schemas_expose_parameter_descriptions():
 
     mcp = build_server()
     tools = {tool.name: tool for tool in asyncio.run(mcp.list_tools())}
-    prompt_props = tools["opencode_prompt"].inputSchema["properties"]
-    continue_props = tools["opencode_continue"].inputSchema["properties"]
-    abort_props = tools["opencode_abort"].inputSchema["properties"]
+    prompt_props = tools["opencode_prompt"].input_schema["properties"]
+    continue_props = tools["opencode_continue"].input_schema["properties"]
+    abort_props = tools["opencode_abort"].input_schema["properties"]
 
     for name in ("prompt", "read_only", "directory", "model", "timeout"):
         assert prompt_props[name]["description"]
@@ -308,7 +308,7 @@ def test_tool_schemas_expose_parameter_descriptions():
 
 async def test_registered_tool_wrappers_return_public_output_contracts():
     backend = ModernBackend()
-    mcp = FastMCP("contract")
+    mcp = MCPServer("contract")
     register_tools(mcp, backend)
 
     prompt = await _call_tool_text(
@@ -334,7 +334,7 @@ async def test_registered_tool_wrappers_return_public_output_contracts():
 
 async def test_registered_tool_wrappers_return_error_text_contracts():
     backend = FailingBackend()
-    mcp = FastMCP("errors")
+    mcp = MCPServer("errors")
     register_tools(mcp, backend)
 
     prompt = await _call_tool_text(mcp, "failing_prompt", {"prompt": "hello"})

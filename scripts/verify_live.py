@@ -1,11 +1,12 @@
 """Live verification client for cross-agent-mcp.
 
 Spawns the real installed server via `uvx --from . cross-agent-mcp`, lists tools,
-and calls opencode_prompt + claude_prompt expecting real responses.
+and optionally calls opencode_prompt + claude_prompt expecting real responses.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
 import sys
@@ -16,16 +17,19 @@ from mcp.client.stdio import stdio_client
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-async def main() -> None:
+async def main(*, startup_only: bool = False) -> None:
+    uvx_args = ["--from", ".[claude]", "cross-agent-mcp"]
+    if startup_only:
+        uvx_args.insert(0, "--refresh")
     params = StdioServerParameters(
         command="uvx",
-        args=["--from", ".[claude]", "cross-agent-mcp"],
+        args=uvx_args,
         cwd=REPO,
         # Pass the full user env so the server (and any opencode serve it spawns)
         # inherits provider credentials like WANDB_API_KEY that opencode reads.
         env=os.environ,
     )
-    print(">> launching: uvx --from . cross-agent-mcp", flush=True)
+    print(f">> launching: uvx {' '.join(uvx_args)}", flush=True)
     async with stdio_client(params, errlog=sys.stderr) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -36,6 +40,10 @@ async def main() -> None:
             assert "opencode_prompt" in names, "opencode_prompt missing"
             assert "opencode_continue" in names
             assert "opencode_abort" in names
+
+            if startup_only:
+                print(">> STARTUP VERIFICATION PASSED", flush=True)
+                return
 
             print(">> calling opencode_prompt ...", flush=True)
             oc = await session.call_tool("opencode_prompt", {"prompt": "Reply with exactly: PONG"})
@@ -58,8 +66,15 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--startup-only",
+        action="store_true",
+        help="Freshly resolve the package, initialize the server, and list its tools.",
+    )
+    args = parser.parse_args()
     try:
-        asyncio.run(main())
+        asyncio.run(main(startup_only=args.startup_only))
     except Exception as exc:
         print(f">> VERIFICATION FAILED: {exc}", file=sys.stderr, flush=True)
         raise

@@ -6,13 +6,13 @@ readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "npratt" }]
 dependencies = [
-    "mcp[cli]>=1.28,<2",
+    "mcp>=2,<3",
     "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
-claude = ["claude-agent-sdk>=0.2.110"]
-all = ["claude-agent-sdk>=0.2.110"]
+claude = ["claude-agent-sdk>=0.2.144"]
+all = ["claude-agent-sdk>=0.2.144"]
 
 [project.scripts]
 cross-agent-mcp = "cross_agent.server:main"

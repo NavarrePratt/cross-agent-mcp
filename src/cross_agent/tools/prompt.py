@@ -1,11 +1,11 @@
-"""Tool factory: registers prompt/continue/abort tools for a backend on a FastMCP server."""
+"""Tool factory: registers prompt/continue/abort tools for a backend on an MCP server."""
 
 from __future__ import annotations
 
 import inspect
 from typing import Annotated, Any, Literal
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 from pydantic import Field
 
 from cross_agent.backends.base import Backend
@@ -112,7 +112,7 @@ async def _call_continue(
     return await backend.continue_session(session_id, prompt, read_only, directory, timeout=timeout)
 
 
-def register_tools(mcp: FastMCP, backend: Backend) -> None:
+def register_tools(mcp: MCPServer, backend: Backend) -> None:
     """Register ``<name>_prompt``, ``<name>_continue``, ``<name>_abort`` for one backend.
 
     Each tool surfaces backend errors as ``"Error: ..."`` text rather than raising,
@@ -195,7 +195,7 @@ def register_tools(mcp: FastMCP, backend: Backend) -> None:
             return f"Error: {type(exc).__name__}: {exc}"
         return f"Abort requested for session {session_id}."
 
-    # FastMCP derives the MCP tool name from the explicit ``name`` kwarg, so the
+    # MCPServer derives the MCP tool name from the explicit ``name`` kwarg, so the
     # closures do not need distinct ``__name__`` attributes.
     mcp.tool(name=f"{prefix}_prompt", description=_prompt_desc())(_prompt)
     mcp.tool(name=f"{prefix}_continue", description=_continue_desc())(_continue)

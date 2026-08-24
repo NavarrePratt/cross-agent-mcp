@@ -1,10 +1,11 @@
-"""FastMCP entry point: detect available backends and register their tools."""
+"""MCPServer entry point: detect available backends and register their tools."""
 
 from __future__ import annotations
 
 import sys
+from importlib.metadata import version
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 from cross_agent.backends.base import Backend
 from cross_agent.backends.opencode import OpenCodeBackend
@@ -39,10 +40,11 @@ def get_available_backends() -> list[Backend]:
     return backends
 
 
-def build_server() -> FastMCP:
-    """Construct the FastMCP server with tools for every available backend."""
-    mcp = FastMCP(
+def build_server() -> MCPServer:
+    """Construct the MCP server with tools for every available backend."""
+    mcp = MCPServer(
         SERVER_NAME,
+        version=version("cross-agent-mcp"),
         instructions=(
             "Cross-family conversation server. Provides prompt, continue, "
             "and abort tools for each available backend (opencode for GLM-5.2, "
