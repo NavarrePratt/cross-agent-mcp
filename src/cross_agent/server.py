@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
 from importlib.metadata import version
 
 from mcp.server import MCPServer
 
 from cross_agent.backends.base import Backend
+from cross_agent.backends.codex import CodexBackend
 from cross_agent.backends.opencode import OpenCodeBackend
 from cross_agent.tools.prompt import register_tools
 
@@ -18,10 +20,14 @@ def get_available_backends() -> list[Backend]:
     """Return the backends available in this install.
 
     The opencode backend is always available (httpx ships with the package). The
-    Claude backend requires the optional ``claude-agent-sdk`` extra; if it is not
-    installed we silently skip it so only ``opencode_*`` tools register.
+    Codex backend registers when the ``codex`` CLI is on PATH. The Claude backend
+    requires the optional ``claude-agent-sdk`` extra; if it is not installed we
+    silently skip it.
     """
     backends: list[Backend] = [OpenCodeBackend()]
+    codex = CodexBackend()
+    if shutil.which(codex.binary):
+        backends.append(codex)
     try:
         import claude_agent_sdk  # noqa: F401  # local import keeps SDK optional
     except ImportError:
@@ -48,7 +54,7 @@ def build_server() -> MCPServer:
         instructions=(
             "Cross-family conversation server. Provides prompt, continue, "
             "and abort tools for each available backend (opencode for GLM-5.2, "
-            "claude for Claude Code). Read-only is requested by default, with "
+            "codex for Codex, claude for Claude Code). Read-only is requested by default, with "
             "enforcement depending on backend configuration. Use the "
             "<backend>_prompt tool to start a backend-native conversation, "
             "<backend>_continue to resume a native session by id, and "

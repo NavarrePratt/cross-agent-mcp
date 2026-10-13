@@ -24,8 +24,9 @@ ReadOnlyArg = Annotated[
     bool,
     Field(
         description=(
-            "Request read-only behavior. Claude enforces tool restrictions; opencode "
-            "requires a configured read-only agent for hard enforcement."
+            "Request read-only behavior. Claude enforces tool restrictions; Codex uses "
+            "its read-only sandbox; opencode requires a configured read-only agent for "
+            "hard enforcement."
         )
     ),
 ]
@@ -124,9 +125,9 @@ def register_tools(mcp: MCPServer, backend: Backend) -> None:
         return (
             f"Start a native {prefix} session for a cross-model conversation.\n\n"
             "Read-only is requested by default. Enforcement depends on the backend "
-            "and configuration: Claude restricts tools directly; opencode requires a "
-            "configured read-only agent for hard enforcement. Pass read_only=False "
-            "only if you explicitly want write/exec access.\n\n"
+            "and configuration: Claude restricts tools directly; Codex uses its read-only "
+            "sandbox; opencode requires a configured read-only agent for hard enforcement. "
+            "Pass read_only=False only if you explicitly want write/exec access.\n\n"
             f"Returns the response text prefixed with the native session id, which can be "
             f"passed to {prefix}_continue to resume the conversation.\n\n"
             "timeout (seconds) overrides the configured default for this MCP call; "

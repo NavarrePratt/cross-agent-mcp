@@ -62,6 +62,31 @@ async def main(*, startup_only: bool = False) -> None:
             assert "Error:" not in cl_text, "claude_prompt returned an error"
             assert "PONG" in cl_text, "claude_prompt did not return a real response"
 
+            assert "codex_prompt" in names, "codex_prompt missing (codex CLI not on PATH?)"
+            print(">> calling codex_prompt ...", flush=True)
+            cx = await session.call_tool(
+                "codex_prompt",
+                {"prompt": "Remember the word PONG. Reply with exactly: OK", "directory": REPO},
+            )
+            cx_text = "".join(b.text for b in cx.content if getattr(b, "type", "") == "text")
+            print(f">> codex_prompt result:\n{cx_text}\n", flush=True)
+            assert "Error:" not in cx_text, "codex_prompt returned an error"
+            codex_session = cx_text.split("\n", 1)[0].removeprefix("Session: ")
+
+            print(">> calling codex_continue ...", flush=True)
+            cc = await session.call_tool(
+                "codex_continue",
+                {
+                    "session_id": codex_session,
+                    "prompt": "Which word did I ask you to remember? Reply with just the word.",
+                    "directory": REPO,
+                },
+            )
+            cc_text = "".join(b.text for b in cc.content if getattr(b, "type", "") == "text")
+            print(f">> codex_continue result:\n{cc_text}\n", flush=True)
+            assert "Error:" not in cc_text, "codex_continue returned an error"
+            assert "PONG" in cc_text, "codex_continue did not resume the session"
+
     print(">> VERIFICATION PASSED", flush=True)
 
 

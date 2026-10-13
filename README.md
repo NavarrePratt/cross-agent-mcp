@@ -2,9 +2,9 @@
 
 > **Warning: this project was vibe coded.** It was built interactively with GLM-5.2 on the [opencode](https://opencode.ai) harness, with inference provided by [WandB](https://wandb.ai). Expect rough edges, untested code paths, and bugs. The author is actively using it day to day, so issues are being found and fixed as they surface, but treat the current state accordingly.
 
-An MCP server that wraps two AI coding-agent backends - [opencode](https://opencode.ai) and [Claude Code](https://docs.claude.com/en/docs/claude-code) - behind a unified `prompt` / `continue` / `abort` tool interface for cross-family conversations, second opinions, and adversarial code review. One backend lets a Claude session ask an opencode model such as GLM-5.2 for another perspective; the other lets opencode or Codex ask Claude. The server runs as a stdio MCP server and is intended to be registered in whichever coding agent you drive day to day.
+An MCP server that wraps three AI coding-agent backends - [opencode](https://opencode.ai), [Codex](https://github.com/openai/codex), and [Claude Code](https://docs.claude.com/en/docs/claude-code) - behind a unified `prompt` / `continue` / `abort` tool interface for cross-family conversations, second opinions, and adversarial code review. A Claude session can ask an opencode model such as GLM-5.2 or Codex for another perspective, and opencode or Codex can ask Claude. The server runs as a stdio MCP server and is intended to be registered in whichever coding agent you drive day to day.
 
-Install just the opencode backend, or install both with the optional `[claude]` extra. No separate API keys are required: opencode uses its configured provider auth, and the Claude backend reuses the `claude` CLI's stored login. If the opencode provider reads credentials from environment variables, the MCP client must forward them to this server.
+Install just the opencode backend, or install both with the optional `[claude]` extra. No separate API keys are required: opencode uses its configured provider auth, the Codex backend reuses the `codex` CLI's stored login, and the Claude backend reuses the `claude` CLI's stored login. If the opencode provider reads credentials from environment variables, the MCP client must forward them to this server.
 
 ## Install
 
@@ -24,6 +24,7 @@ The `[claude]` extra pulls in `claude-agent-sdk`, which spawns the `claude` CLI 
 
 - `uv` / `uvx` on your PATH.
 - `opencode` on your PATH (for the opencode backend). The server will auto-start `opencode serve` if one is not already running; see [environment variables](#environment-variables).
+- `codex` on your PATH with a stored login (for the Codex backend). The `codex_*` tools register only when the CLI is found.
 - `claude` on your PATH with a stored login (for the Claude backend). The SDK inherits the CLI's stored auth - no `ANTHROPIC_API_KEY` is needed.
 
 ## Configuration
@@ -49,7 +50,7 @@ Add to the `mcpServers` block in `~/.claude.json` (or run `claude mcp add`):
 }
 ```
 
-Claude Code exposes the tools as `mcp__cross-agent__opencode_prompt`, `mcp__cross-agent__claude_prompt`, etc.
+Claude Code exposes the tools as `mcp__cross-agent__opencode_prompt`, `mcp__cross-agent__codex_prompt`, `mcp__cross-agent__claude_prompt`, etc. Set `CROSS_AGENT_CODEX_MODEL` in `env` if you want read-only Codex calls to use a model other than the Codex default; see [Codex backend](#codex-backend).
 
 ### Codex
 
@@ -150,6 +151,17 @@ Provider-specific variables such as `WANDB_API_KEY` and
 They must still be present in the MCP server environment because an
 automatically started `opencode serve` process inherits that environment.
 
+### Codex backend
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `CROSS_AGENT_CODEX_BIN` | `codex` | Codex CLI executable name or path |
+| `CROSS_AGENT_CODEX_MODEL` | unset (Codex default) | Model used for every call unless `model` is passed to `codex_prompt` |
+| `CROSS_AGENT_CODEX_REASONING_EFFORT` | unset (Codex default) | Value for Codex's `model_reasoning_effort` setting, such as `high` |
+| `CROSS_AGENT_QUERY_TIMEOUT` | `1200` (20 min) | Query timeout in seconds for all backends |
+
+Read-only Codex calls run with `--ignore-user-config`, so they do not use the `model` or `model_reasoning_effort` values from `~/.codex/config.toml`. Set the variables above to choose them. `codex_continue` has no `model` parameter, so set `CROSS_AGENT_CODEX_MODEL` to keep a resumed session on the same model.
+
 ### Claude backend
 
 | Env var | Default | Purpose |
@@ -161,7 +173,7 @@ No auth env vars are needed for the Claude backend; it reuses the `claude` CLI's
 
 ## Tool reference
 
-Each backend registers three tools, prefixed with the backend name: `opencode_prompt` / `opencode_continue` / `opencode_abort` and `claude_prompt` / `claude_continue` / `claude_abort`. The Claude tools only register when the `[claude]` extra is installed.
+Each backend registers three tools, prefixed with the backend name: `opencode_prompt` / `opencode_continue` / `opencode_abort`, `codex_prompt` / `codex_continue` / `codex_abort`, and `claude_prompt` / `claude_continue` / `claude_abort`. The Codex tools only register when the `codex` CLI is on PATH, and the Claude tools only register when the `[claude]` extra is installed.
 
 Errors are returned as `"Error: <Type>: <message>"` text rather than raised, so the calling agent always gets a readable result.
 
@@ -277,6 +289,7 @@ Large prompts waste tokens and context window on both sides. The reviewer is a c
 The server is a thin [FastMCP](https://gofastmcp.com) stdio server. At startup it detects which backends are available and registers their tools:
 
 - **opencode backend** drives a local `opencode serve` HTTP API over `httpx` (default `http://127.0.0.1:4096`). On the first call it health-checks the server and, if `CROSS_AGENT_OPENCODE_AUTOSERVE` is enabled, spawns `opencode serve` as a subprocess it owns and tears it down on shutdown. Read-only calls optionally request a configured read-only opencode agent. While a message is running, the backend watches OpenCode's pending-permission endpoint for that exact native session. A matching unattended request cancels the message, attempts a native abort, and returns the session id, permission, pattern count, working context, and whether abort was confirmed; raw permission patterns are not returned. OpenCode versions that return 404 or 405 retain the existing global-timeout fallback. The backend leaves successful prompt sessions durable in opencode, sanitizes the `directory` value before it lands in an HTTP header (stripping NUL/CR/LF to prevent header injection), URL-encodes session ids in request paths, and redacts secret-like patterns (`sk-...`, `sk_live_...`, `ghp_...`, `github_pat_...`, `hf_...`, `xox...`, `whsec_...`, long hex/base64 blobs) from response text before it reaches the MCP client.
+- **Codex backend** runs `codex exec --json` as a subprocess, because Codex CLI 0.154.0 removed `codex mcp-server`. The prompt is sent on stdin, and `codex_continue` runs `codex exec resume <thread_id>`. Every call sets `approval_policy="never"`, because no person is present to approve actions. Read-only calls also pass `--sandbox=read-only` and `--ignore-user-config`. Skipping user config keeps Codex from loading user MCP servers and plugins, which could include this server. A `-c mcp_servers={}` override does not work for this, because Codex merges it into the configured table. The response is the last agent message of the turn. `abort` terminates the running `codex exec` process.
 - **Claude backend** drives `claude-agent-sdk`, which spawns the `claude` CLI in-process and inherits the calling environment, so it reuses the CLI's stored enterprise auth with no API key. Read-only calls expose and pre-approve only `Read`, `Glob`, `Grep`, `LS`, `WebSearch`, and `WebFetch`; use the SDK's `dontAsk` mode; disable filesystem setting sources and skills; and ignore inherited MCP configuration. This isolation means CLAUDE.md and filesystem settings are not loaded automatically for read-only calls, although the model can read relevant instruction files as ordinary context when directed. Running sessions are tracked by asyncio task so `abort` can cancel an in-flight call, falling back to `claude stop <session_id>` for already-finished sessions.
 
 Prompt calls create backend-native sessions that remain durable in the native
